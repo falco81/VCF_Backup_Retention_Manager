@@ -1,0 +1,50 @@
+{
+  "_comment_top": "Example retention config for VCF 5.2.2. Adjust 'path' values and retention numbers for your environment, then run: python3 vcf_backup_retention.py -c config-vcf52.json --dry-run --verbose",
+
+  "log": {
+    "file": "/var/log/vcf-backup-retention.log",
+    "level": "INFO",
+    "max_size_mb": 10,
+    "backup_count": 5
+  },
+
+  "backup_targets": [
+
+    {
+      "_comment": "SDDC Manager file-based backup. Files like 'vcf-backup-<host>-<domain>-YYYY-MM-DD-HH-MM-SS.tar.gz'. Default schedule in VCF is daily at 04:02 + on every state change, so daily count can be high.",
+      "name": "VCF 5.2.2 - SDDC Manager",
+      "path": "/backup/vcf52/sddc-manager",
+      "preset": "sddc_manager",
+      "min_age_minutes": 60,
+      "retention": {
+        "keep_days": 30,
+        "keep_minimum": 10
+      }
+    },
+
+    {
+      "_comment": "NSX-T backups. Layout: <root>/cluster-node-backups/<uuid>-<ip>/<timestamp>/, plus node-backups/ and cluster-backups/. Retention is applied PER node and PER backup type independently. NSX runs hourly cluster backups and daily node backups by default, so volumes can be large.",
+      "name": "VCF 5.2.2 - NSX-T",
+      "path": "/backup/vcf52/nsx",
+      "preset": "nsx",
+      "min_age_minutes": 60,
+      "retention": {
+        "keep_days": 14,
+        "keep_minimum": 7
+      }
+    },
+
+    {
+      "_comment": "vCenter Server file-based backup (VAMI). Each backup is a folder named like 'sn_<ip>M_<version>_YYYYMMDD_HHMMSS_<base64>='. vCenter has its own retention setting in VAMI, so this is mostly a safety net.",
+      "name": "VCF 5.2.2 - vCenter Server",
+      "path": "/backup/vcf52/vcenter",
+      "preset": "vcenter",
+      "min_age_minutes": 60,
+      "retention": {
+        "keep_days": 30,
+        "keep_minimum": 7
+      }
+    }
+
+  ]
+}
