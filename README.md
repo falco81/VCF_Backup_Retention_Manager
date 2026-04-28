@@ -14,10 +14,50 @@ Supports the following VCF backup formats out of the box:
 | vCenter Server (VAMI) | 5.x and 9.x | directory | `sn_<ip>M_<ver>_<YYYYMMDD>_<HHMMSS>_<base64>=` |
 | Fleet Manager / VCF Identity Broker / VCF Automation | 9.x | directory | `vcf/backups/<cluster>/<version>/<component>/<timestamp>/...tgz` |
 
+## Quick start: configuration wizard
+
+If you don't want to write JSON by hand, run the included wizard - it asks
+questions, lets you pick from preset regex patterns, and writes a JSON
+config for you. The wizard requires `colorama` (and optionally
+`pyreadline3` on Windows for editable defaults):
+
+```bash
+# Linux / macOS
+pip install colorama
+python3 vcf_retention_wizard.py
+
+# Windows
+pip install colorama pyreadline3
+python vcf_retention_wizard.py
+```
+
+The wizard offers two paths:
+
+- **Simple mode** - guided setup for typical VCF 5.2.x or VCF 9.x
+  deployments. You answer a few questions per component (path, retention
+  days, minimum kept) and the wizard fills in the rest using built-in
+  presets.
+- **Advanced mode** - full control. Lets you build custom targets with
+  your own regex patterns (file or directory mode), override preset
+  values, set per-target `min_age_minutes`, mix `keep_days` with
+  `keep_count`, etc. When you pick `file` type for a custom target,
+  the wizard offers a catalog of common regex patterns (PostgreSQL
+  dumps, ISO timestamps, date-only filenames, mtime fallback, etc.)
+  to pick from or adapt.
+
+After saving the config, the wizard prints the exact commands to test it
+in dry-run mode and then run it live.
+
+The rest of this document describes the JSON config format directly, in
+case you want to write or edit it by hand.
+
 ## Files
 
-- `vcf_backup_retention.py` - the script
+- `vcf_backup_retention.py` - the retention script (no external dependencies)
+- `vcf_retention_wizard.py` - interactive wizard that generates a JSON config
 - `config.json` - example configuration covering VCF 5.2.2 + VCF 9
+- `config-vcf52.json` - example for VCF 5.2.x only
+- `config-vcf9.json` - example for VCF 9.x only
 - `README.md` - this file
 
 ## Requirements
