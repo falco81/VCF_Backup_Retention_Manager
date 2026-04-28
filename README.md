@@ -14,42 +14,18 @@ Supports the following VCF backup formats out of the box:
 | vCenter Server (VAMI) | 5.x and 9.x | directory | `sn_<ip>M_<ver>_<YYYYMMDD>_<HHMMSS>_<base64>=` |
 | Fleet Manager / VCF Identity Broker / VCF Automation | 9.x | directory | `vcf/backups/<cluster>/<version>/<component>/<timestamp>/...tgz` |
 
-## Quick start: configuration wizard
+## Quick start
 
-If you don't want to write JSON by hand, run the included wizard - it asks
-questions, lets you pick from preset regex patterns, and writes a JSON
-config for you. The wizard requires `colorama` (and optionally
-`pyreadline3` on Windows for editable defaults):
+You can either:
 
-```bash
-# Linux / macOS
-pip install colorama
-python3 vcf_retention_wizard.py
+1. **Use the configuration wizard** (recommended for most people) - an
+   interactive tool that asks questions and writes the JSON for you.
+   See the [Configuration wizard](#configuration-wizard) section at the
+   end of this document.
+2. **Write the JSON config by hand** using the reference below.
 
-# Windows
-pip install colorama pyreadline3
-python vcf_retention_wizard.py
-```
-
-The wizard offers two paths:
-
-- **Simple mode** - guided setup for typical VCF 5.2.x or VCF 9.x
-  deployments. You answer a few questions per component (path, retention
-  days, minimum kept) and the wizard fills in the rest using built-in
-  presets.
-- **Advanced mode** - full control. Lets you build custom targets with
-  your own regex patterns (file or directory mode), override preset
-  values, set per-target `min_age_minutes`, mix `keep_days` with
-  `keep_count`, etc. When you pick `file` type for a custom target,
-  the wizard offers a catalog of common regex patterns (PostgreSQL
-  dumps, ISO timestamps, date-only filenames, mtime fallback, etc.)
-  to pick from or adapt.
-
-After saving the config, the wizard prints the exact commands to test it
-in dry-run mode and then run it live.
-
-The rest of this document describes the JSON config format directly, in
-case you want to write or edit it by hand.
+The rest of this document describes the JSON config format and how to run
+the retention script. The wizard is documented at the very end.
 
 ## Files
 
@@ -837,3 +813,201 @@ Each run ends with a summary block:
   Space freed       : 12.34 GB
 ########## End of Run ##########
 ```
+
+---
+
+## Configuration wizard
+
+If you don't want to write JSON by hand, the package includes an interactive
+wizard (`vcf_retention_wizard.py`) that asks questions and produces a valid
+config file ready for use with `vcf_backup_retention.py`.
+
+### Requirements
+
+The wizard requires only **`colorama`** (for colored prompts). The retention
+script itself has zero external dependencies; the wizard is the only place
+that needs `colorama`.
+
+```bash
+pip install colorama
+```
+
+That's all. No `pyreadline3`, no `prompt_toolkit`, nothing else - editable
+default values are implemented via raw terminal mode (Linux: `termios`;
+Windows: `msvcrt`), both available in the Python standard library.
+
+### Running the wizard
+
+```bash
+# Linux
+python3 vcf_retention_wizard.py
+
+# Windows
+python vcf_retention_wizard.py
+```
+
+Optional: pass `-o` to choose the default output filename:
+
+```bash
+python3 vcf_retention_wizard.py -o config-vcf52.json
+```
+
+### Two setup paths
+
+When the wizard starts it asks which mode you want:
+
+```
+Choose a setup mode:
+  1) Simple   - guided setup using built-in VCF presets (recommended)
+  2) Advanced - full control: custom targets, regex patterns, overrides
+```
+
+#### Simple mode
+
+Guided setup for the standard VCF 5.2.x or VCF 9.x components. Steps:
+
+1. **Pick the VCF version** - either `1) VCF 5.2.x only` or
+   `2) VCF 9.x only`. If you have both, run the wizard twice and either
+   merge the resulting files or keep them as two cron jobs.
+2. **Base backup path** - where backups land on your server. Default
+   `/backup`, editable.
+3. **Log file path** - default `/var/log/vcf-backup-retention.log`,
+   editable.
+4. **Per-component questions** - for each VCF component, the wizard asks:
+   - Manage this component? (Y/n)
+   - Backup path (with a sensible auto-generated default)
+   - Keep backups for how many days
+   - Always keep at least how many newest backups (safety floor)
+
+Components offered:
+
+- VCF 5.2.x: SDDC Manager, NSX-T, vCenter Server
+- VCF 9.x: SDDC Manager, NSX, vCenter Server, Fleet Management
+  (Fleet Manager + Identity Broker + Automation)
+
+The wizard fills in the rest (regex pattern, timestamp parsing, item type)
+from the built-in presets.
+
+#### Advanced mode
+
+Full control. Adds these capabilities on top of simple mode:
+
+- **Logging settings** - log level, max file size, rotation count
+- **Multiple targets** - add one target at a time, then either add another
+  or finish
+- **Preset target with overrides** - pick a preset, then optionally set
+  per-target `min_age_minutes`, mix `keep_days` with `keep_count`,
+  override the regex pattern of the preset
+- **Custom targets** - skip the presets entirely and define everything by
+  hand: type (file or directory), regex pattern, timestamp formats,
+  recursion, retention
+
+When you create a **custom file-mode target**, the wizard shows a catalog
+of common regex patterns to pick from:
+
+```
+Pick a pattern for file names, or write your own:
+  1) Single timestamp like '...-2025-04-25-03-00-00.tar.gz'
+     regex:    ^.+-(\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2})\..+$
+     formats:  %Y-%m-%d-%H-%M-%S
+     matches:  myapp-2025-04-25-03-00-00.tar.gz
+
+  2) Date+time as separate groups like '..._20250425_030000.sql.gz'
+     regex:    ^.+_(\d{8})_(\d{6})\..+$
+     formats:  %Y%m%d%H%M%S
+     matches:  prod_db_20250425_030000.sql.gz
+
+  3) ISO timestamp like '...-2025-04-25T03-00-00.zip'
+  4) Date only like '...-2025-04-25.tar.bz2'
+  5) Compact timestamp like '...20250425-030000.tgz'
+  6) No date in name - use file mtime
+  7) Custom - write your own pattern
+```
+
+After picking, you can either use the pattern as-is or tweak it. Picking
+"Custom" lets you write any regex; the wizard validates that it compiles
+before saving the config.
+
+For **custom directory-mode targets** the wizard offers a smaller catalog
+of timestamp folder patterns (NSX-style, ISO, compact) plus a
+"write your own" option.
+
+### Editable defaults
+
+Everywhere a default value is offered, it is **pre-filled at the cursor**
+so you can press Enter to accept, or use Backspace / typing to edit it
+directly. No need to retype the whole default just to change one character.
+
+```
+Where on this server do backups land? (base path): /backup█
+                                                          ↑ cursor
+```
+
+Keyboard shortcuts inside an editable prompt:
+
+| Key | Action |
+|---|---|
+| Enter | Accept the current value |
+| Backspace | Delete the previous character |
+| Ctrl-U | Clear the entire line |
+| Ctrl-W | Delete the previous word |
+| Ctrl-C | Cancel the wizard |
+| Ctrl-D | Cancel (when the line is empty) |
+
+Editable defaults work on Linux, macOS, and Windows 10+ without any extra
+packages. When the wizard runs without a TTY (e.g. piped input for
+automation), it automatically falls back to a `[default]: ` style prompt
+where empty input is treated as "accept default".
+
+### After saving
+
+The wizard validates the config and saves it to the path you specify
+(default `vcf-retention-config.json`). It then prints the exact commands
+to run:
+
+```
+Next steps:
+  1. Test (no deletes):  python3 vcf_backup_retention.py -c config.json --dry-run --verbose
+  2. Run live:           python3 vcf_backup_retention.py -c config.json
+  3. Schedule via cron (Linux) or Task Scheduler (Windows).
+     See README.md for details.
+```
+
+Always run with `--dry-run --verbose` first to confirm the wizard's output
+matches what you actually want before scheduling it.
+
+### Editing a wizard-generated config later
+
+The output is plain JSON; you can open it in any editor and tweak any value
+by hand later. To adjust retention numbers, re-add a target you previously
+declined, or temporarily disable a target, just edit the file - the wizard
+isn't required for changes.
+
+To keep a target permanently in the file but skip it during runs, set
+`"enabled": false`:
+
+```json
+{
+  "name": "VCF 5.2.x - vCenter Server",
+  "enabled": false,
+  ...
+}
+```
+
+This is documented under [Per-target keys](#per-target-keys) above.
+
+### Troubleshooting the wizard
+
+- **"Value cannot be empty."** - you pressed Enter on a prompt that
+  required input (a name or path with no default). Type a value.
+- **"'foo' is not a valid integer."** - re-enter a number.
+- **Cursor stays at start, can't see default** - your terminal doesn't
+  support raw mode, or stdin/stdout aren't a TTY (running under some IDEs
+  or remote shells). The wizard falls back to `[default]: ` mode in that
+  case; just press Enter to accept or type a new value.
+- **Colored output looks like garbage** (`\x1b[1;36m...`) - either your
+  terminal doesn't render ANSI (rare on modern Windows 10+ and any Linux
+  terminal) or `colorama` isn't installed. Install with
+  `pip install colorama`.
+- **Wizard exits with `Cancelled by user.`** - you pressed Ctrl-C or
+  Ctrl-D, or hit EOF on piped input. No file is saved.
