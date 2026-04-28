@@ -44,7 +44,9 @@ except ImportError:
     sys.exit(1)
 
 # ---------------------------------------------------------------------------
-# Readline setup (for editable defaults in prompts)
+# Readline (legacy) - kept for environments where it works, but the editable
+# prompt below uses raw terminal mode instead, which is more reliable
+# across Linux/Windows.
 # ---------------------------------------------------------------------------
 HAS_READLINE = False
 try:
@@ -52,10 +54,10 @@ try:
     HAS_READLINE = True
 except ImportError:
     try:
-        import pyreadline3 as readline  # Windows fallback
+        import pyreadline3 as readline  # noqa: F401
         HAS_READLINE = True
     except ImportError:
-        readline = None  # graceful degradation
+        readline = None
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -193,25 +195,201 @@ def section(title: str):
 
 
 # ---------------------------------------------------------------------------
+# Editable input (raw terminal mode)
+# ---------------------------------------------------------------------------
+# Prints a prompt with the default value already typed at the cursor, so the
+# user can press Enter to accept, or use backspace / typing to edit. Works
+# without external dependencies via termios on Linux/macOS and msvcrt on
+# Windows. Falls back to a [bracket] prompt when stdin/stdout aren't a TTY.
+
+def _editable_input(prompt_str: str, default: str) -> str:
+    """Show `prompt_str + default` with cursor at the end of `default`;
+    let user edit and press Enter; return the final string.
+
+    Falls back to the classic '[default]: ' prompt when raw mode isn't
+    available (non-TTY input/output, or platform without termios/msvcrt)."""
+
+    # No TTY - bracket fallback
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        raw = input(f"{prompt_str} {c_hint(f'[{default}]')}: ").strip()
+        return raw or default
+
+    if os.name == "nt":
+        try:
+            import msvcrt  # noqa: F401
+        except ImportError:
+            raw = input(f"{prompt_str} {c_hint(f'[{default}]')}: ").strip()
+            return raw or default
+        return _editable_input_windows(prompt_str, default)
+    else:
+        try:
+            import termios, tty  # noqa: F401
+        except ImportError:
+            raw = input(f"{prompt_str} {c_hint(f'[{default}]')}: ").strip()
+            return raw or default
+        try:
+            return _editable_input_unix(prompt_str, default)
+        except OSError:
+            # tcgetattr may fail on weird stdin; fall back gracefully
+            sys.stdout.write("\n")
+            raw = input(f"{prompt_str} {c_hint(f'[{default}]')}: ").strip()
+            return raw or default
+
+
+def _editable_input_unix(prompt_str: str, default: str) -> str:
+    """Linux/macOS implementation of editable input using termios."""
+    import termios
+
+    sys.stdout.write(f"{prompt_str}: {default}")
+    sys.stdout.flush()
+
+    buf = list(default)
+
+    fd = sys.stdin.fileno()
+    old_attrs = termios.tcgetattr(fd)
+    new_attrs = list(old_attrs)
+    # Turn off canonical mode (line buffering) and echo. Keep ISIG so Ctrl-C
+    # still works if needed; we also handle \x03 manually below for clarity.
+    new_attrs[3] = new_attrs[3] & ~(termios.ICANON | termios.ECHO)
+
+    try:
+        termios.tcsetattr(fd, termios.TCSANOW, new_attrs)
+        while True:
+            ch = sys.stdin.read(1)
+            if not ch:
+                # EOF
+                raise EOFError
+
+            # --- Enter / Return ---
+            if ch in ("\n", "\r"):
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                return "".join(buf)
+
+            # --- Backspace / DEL ---
+            if ch in ("\x7f", "\x08"):
+                if buf:
+                    buf.pop()
+                    sys.stdout.write("\b \b")
+                    sys.stdout.flush()
+                continue
+
+            # --- Ctrl-C ---
+            if ch == "\x03":
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                raise KeyboardInterrupt
+
+            # --- Ctrl-D (EOF if buffer empty) ---
+            if ch == "\x04":
+                if not buf:
+                    sys.stdout.write("\n")
+                    sys.stdout.flush()
+                    raise EOFError
+                continue
+
+            # --- Ctrl-U: clear line ---
+            if ch == "\x15":
+                while buf:
+                    buf.pop()
+                    sys.stdout.write("\b \b")
+                sys.stdout.flush()
+                continue
+
+            # --- Ctrl-W: delete previous word ---
+            if ch == "\x17":
+                while buf and buf[-1] == " ":
+                    buf.pop()
+                    sys.stdout.write("\b \b")
+                while buf and buf[-1] != " ":
+                    buf.pop()
+                    sys.stdout.write("\b \b")
+                sys.stdout.flush()
+                continue
+
+            # --- Escape sequences (arrow keys etc): consume and ignore ---
+            if ch == "\x1b":
+                # Common ANSI: ESC [ X (3 bytes total). Read up to 2 more.
+                try:
+                    nxt = sys.stdin.read(1)
+                    if nxt == "[":
+                        sys.stdin.read(1)
+                except Exception:
+                    pass
+                continue
+
+            # --- Printable character ---
+            if ch.isprintable():
+                buf.append(ch)
+                sys.stdout.write(ch)
+                sys.stdout.flush()
+            # else: ignore other control chars
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
+
+
+def _editable_input_windows(prompt_str: str, default: str) -> str:
+    """Windows implementation of editable input using msvcrt."""
+    import msvcrt
+
+    sys.stdout.write(f"{prompt_str}: {default}")
+    sys.stdout.flush()
+
+    buf = list(default)
+
+    while True:
+        ch = msvcrt.getwch()
+
+        # --- Enter ---
+        if ch in ("\r", "\n"):
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            return "".join(buf)
+
+        # --- Backspace ---
+        if ch == "\b":
+            if buf:
+                buf.pop()
+                sys.stdout.write("\b \b")
+                sys.stdout.flush()
+            continue
+
+        # --- Ctrl-C ---
+        if ch == "\x03":
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            raise KeyboardInterrupt
+
+        # --- Ctrl-D / Ctrl-Z (EOF) ---
+        if ch in ("\x04", "\x1a"):
+            if not buf:
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                raise EOFError
+            continue
+
+        # --- Special keys (arrows etc): prefix \xe0 or \x00 + 1 byte ---
+        if ch in ("\xe0", "\x00"):
+            msvcrt.getwch()  # consume and ignore the second byte
+            continue
+
+        # --- Printable ---
+        if ch.isprintable():
+            buf.append(ch)
+            sys.stdout.write(ch)
+            sys.stdout.flush()
+
+
+# ---------------------------------------------------------------------------
 # Input helpers
 # ---------------------------------------------------------------------------
 
 def prompt_text(label: str, default: str = "", allow_empty: bool = False) -> str:
-    """Free-text prompt. If 'default' is given, pre-fill it (editable when
-    readline is available AND stdin is a TTY; otherwise show in [brackets]
-    and accept empty input as 'use default')."""
-    use_prefill = default and HAS_READLINE and sys.stdin.isatty()
+    """Free-text prompt. If `default` is given, it's pre-filled at the cursor
+    so the user can press Enter to accept or start typing/editing immediately."""
     while True:
-        if use_prefill:
-            readline.set_startup_hook(lambda: readline.insert_text(default))
-            try:
-                raw = input(f"{c_question(label)}: ").strip()
-            finally:
-                readline.set_startup_hook()
-        elif default:
-            raw = input(f"{c_question(label)} {c_hint(f'[{default}]')}: ").strip()
-            if not raw:
-                raw = default
+        if default:
+            raw = _editable_input(c_question(label), default).strip()
         else:
             raw = input(f"{c_question(label)}: ").strip()
 
@@ -299,13 +477,11 @@ class Wizard:
         print(c_hint(
             "This wizard will ask you a few questions and produce a JSON\n"
             "config file you can use with vcf_backup_retention.py.\n"
+            "\n"
+            "TIP: Where a default value is offered, it is pre-filled at the\n"
+            "     cursor. Press Enter to accept, or use Backspace / typing\n"
+            "     to edit it.\n"
         ))
-        if not HAS_READLINE and IS_WINDOWS:
-            print(c_warn(
-                "TIP: For editable default values in prompts on Windows, install:\n"
-                "     pip install pyreadline3\n"
-                "     (without it, prompts show defaults in [brackets] and accept empty input)\n"
-            ))
 
         mode = prompt_choice(
             "Choose a setup mode:",
