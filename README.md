@@ -62,6 +62,7 @@ python --version
 | Key | Required | Default | Description |
 |---|---|---|---|
 | `name` | no | path | Display name shown in the log |
+| `enabled` | no | `true` | Set to `false` to skip this target without deleting it from the config |
 | `path` | yes | - | Root directory to scan |
 | `preset` | no | - | One of `nsx`, `sddc_manager`, `vcenter`, `vcf9_fleet`, `generic_timestamp_dir` |
 | `type` | no | from preset / `directory` | `file` or `directory` |

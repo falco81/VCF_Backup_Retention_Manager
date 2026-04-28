@@ -5,11 +5,10 @@
     "max_size_mb": 10,
     "backup_count": 5
   },
-
   "backup_targets": [
-
     {
       "name": "VCF 5.2.2 - SDDC Manager (file-based, tar.gz)",
+      "enabled": true,
       "path": "/backup/vcf52/sddc-manager",
       "preset": "sddc_manager",
       "min_age_minutes": 60,
@@ -18,9 +17,9 @@
         "keep_minimum": 7
       }
     },
-
     {
       "name": "VCF 5.2.2 - NSX-T",
+      "enabled": true,
       "path": "/backup/vcf52/nsx",
       "preset": "nsx",
       "min_age_minutes": 60,
@@ -29,9 +28,9 @@
         "keep_minimum": 7
       }
     },
-
     {
       "name": "VCF 5.2.2 - vCenter Server (VAMI file-based)",
+      "enabled": true,
       "path": "/backup/vcf52/vcenter",
       "preset": "vcenter",
       "min_age_minutes": 60,
@@ -40,9 +39,9 @@
         "keep_minimum": 7
       }
     },
-
     {
       "name": "VCF 9 - SDDC Manager",
+      "enabled": true,
       "path": "/backup/vcf9/sddc-manager",
       "preset": "sddc_manager",
       "min_age_minutes": 60,
@@ -51,9 +50,9 @@
         "keep_minimum": 5
       }
     },
-
     {
       "name": "VCF 9 - NSX",
+      "enabled": true,
       "path": "/backup/vcf9/nsx",
       "preset": "nsx",
       "min_age_minutes": 60,
@@ -62,9 +61,9 @@
         "keep_minimum": 5
       }
     },
-
     {
       "name": "VCF 9 - vCenter Server",
+      "enabled": true,
       "path": "/backup/vcf9/vcenter",
       "preset": "vcenter",
       "min_age_minutes": 60,
@@ -73,9 +72,9 @@
         "keep_minimum": 5
       }
     },
-
     {
       "name": "VCF 9 - Fleet Management (Fleet Manager / Identity Broker / Automation)",
+      "enabled": true,
       "path": "/backup/vcf9/fleet",
       "preset": "vcf9_fleet",
       "min_age_minutes": 60,
@@ -84,6 +83,5 @@
         "keep_minimum": 5
       }
     }
-
   ]
 }

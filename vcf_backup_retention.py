@@ -171,6 +171,7 @@ class BackupRetentionManager:
         self.logger = self._setup_logging()
         self.stats = {
             "targets": 0,
+            "skipped": 0,
             "scanned": 0,
             "kept": 0,
             "deleted": 0,
@@ -375,6 +376,14 @@ class BackupRetentionManager:
 
     def process_target(self, target: dict):
         name = target.get("name", target.get("path", "?"))
+
+        # Allow targets to be temporarily disabled without removing them.
+        # Default is True for backward compatibility.
+        if not target.get("enabled", True):
+            self.logger.info(f"--- Skipping disabled target: {name} ---")
+            self.stats["skipped"] += 1
+            return
+
         path_str = target.get("path")
         if not path_str:
             self.logger.error(f"Target '{name}' has no 'path' set - skipping.")
@@ -589,6 +598,7 @@ class BackupRetentionManager:
         gb_freed = self.stats["bytes_freed"] / (1024 ** 3)
         self.logger.info("########## Run Summary ##########")
         self.logger.info(f"  Targets processed : {self.stats['targets']}")
+        self.logger.info(f"  Targets skipped   : {self.stats['skipped']}")
         self.logger.info(f"  Backups scanned   : {self.stats['scanned']}")
         self.logger.info(f"  Kept              : {self.stats['kept']}")
         self.logger.info(f"  Deleted           : {self.stats['deleted']}")

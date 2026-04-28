@@ -1,18 +1,16 @@
 {
   "_comment_top": "Example retention config for VCF 9.x. In VCF 9 the backup configuration is split between 'Operations -> Administration -> SDDC Manager -> Backups' (SDDC Manager + NSX) and 'Fleet Management -> Lifecycle -> Settings -> SFTP/Backup' (Fleet Manager, VCF Identity Broker, VCF Automation). Adjust paths to match the SFTP directories you configured in each place.",
-
   "log": {
     "file": "/var/log/vcf-backup-retention.log",
     "level": "INFO",
     "max_size_mb": 10,
     "backup_count": 5
   },
-
   "backup_targets": [
-
     {
       "_comment": "SDDC Manager backup, same format as VCF 5.x: 'vcf-backup-<host>-<domain>-YYYY-MM-DD-HH-MM-SS.tar.gz'.",
       "name": "VCF 9 - SDDC Manager",
+      "enabled": true,
       "path": "/backup/vcf9/sddc-manager",
       "preset": "sddc_manager",
       "min_age_minutes": 60,
@@ -21,10 +19,10 @@
         "keep_minimum": 10
       }
     },
-
     {
       "_comment": "NSX backups, same layout as VCF 5.x: cluster-node-backups/<uuid>/<timestamp>/, node-backups/, cluster-backups/. Retention applied per node and per backup type.",
       "name": "VCF 9 - NSX",
+      "enabled": true,
       "path": "/backup/vcf9/nsx",
       "preset": "nsx",
       "min_age_minutes": 60,
@@ -33,10 +31,10 @@
         "keep_minimum": 7
       }
     },
-
     {
       "_comment": "vCenter Server file-based backup (VAMI). Folder format: 'sn_<ip>M_<version>_YYYYMMDD_HHMMSS_<base64>='.",
       "name": "VCF 9 - vCenter Server",
+      "enabled": true,
       "path": "/backup/vcf9/vcenter",
       "preset": "vcenter",
       "min_age_minutes": 60,
@@ -45,10 +43,10 @@
         "keep_minimum": 7
       }
     },
-
     {
       "_comment": "VCF 9 Fleet Management backups - covers Fleet Manager, VCF Identity Broker (VIDB), and VCF Automation (VCFA). Layout per Broadcom docs: vcf/backups/<cluster-name>/<version>/<component-name>/<timestamp>/<file>.tgz. Retention is applied PER component automatically.",
       "name": "VCF 9 - Fleet Management (Fleet Manager / Identity Broker / Automation)",
+      "enabled": true,
       "path": "/backup/vcf9/fleet",
       "preset": "vcf9_fleet",
       "min_age_minutes": 60,
@@ -57,6 +55,5 @@
         "keep_minimum": 5
       }
     }
-
   ]
 }
