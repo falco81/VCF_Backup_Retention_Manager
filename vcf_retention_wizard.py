@@ -140,16 +140,14 @@ FILE_REGEX_EXAMPLES = [
     },
 ]
 
-# Default log path per OS
+# Default log path - always Linux-style; the backup server runs Linux even
+# if the wizard happens to be run on Windows.
 def default_log_path() -> str:
-    if IS_WINDOWS:
-        base = os.environ.get("PROGRAMDATA", r"C:\ProgramData")
-        return str(Path(base) / "vcf-retention" / "vcf-backup-retention.log")
     return "/var/log/vcf-backup-retention.log"
 
 
 def default_backup_root() -> str:
-    return "D:/backup" if IS_WINDOWS else "/backup"
+    return "/backup"
 
 
 # ---------------------------------------------------------------------------
@@ -330,14 +328,14 @@ class Wizard:
     def run_simple(self):
         section("Simple setup")
 
-        # Which VCF version(s)
+        # Which VCF version - explicit choice, no default. If the user has
+        # both versions, they can run the wizard twice (once per version).
         vcf_choice = prompt_choice(
             "Which VCF version do you back up?",
-            ["VCF 5.2.x only", "VCF 9.x only", "Both VCF 5.2.x and VCF 9.x"],
-            default_idx=3,
+            ["VCF 5.2.x only", "VCF 9.x only"],
         )
-        do_v5 = vcf_choice in (1, 3)
-        do_v9 = vcf_choice in (2, 3)
+        do_v5 = (vcf_choice == 1)
+        do_v9 = (vcf_choice == 2)
 
         # Base path
         base_root = prompt_text(
