@@ -48,33 +48,65 @@ from pathlib import Path
 
 PRESETS = {
     # NSX / NSX-T over SFTP. SDDC Manager configures NSX backup automatically.
-    # Layout:
-    #   <root>/cluster-node-backups/<node-uuid>-<ip>/<YYYY-MM-DD-HH-MM-SS>/
-    #   <root>/node-backups/<node-uuid>-<ip>/<YYYY-MM-DD-HH-MM-SS>/
-    #   <root>/cluster-backups/<YYYY-MM-DD-HH-MM-SS>/
+    # Real VCF 5.2.x format observed on disk:
+    #   <root>/<node-uuid>/backup-2026-04-29T10_52_44UTC/
+    # Older / VCF 4.x style:
+    #   <root>/cluster-node-backups/<node-uuid>/2025-04-25-03-00-00/
+    # Pattern matches both styles. Outer alternation is non-capturing so
+    # only the timestamp itself is extracted by capture groups.
     "nsx": {
         "type": "directory",
-        "pattern": r"^\d{4}[-_]\d{2}[-_]\d{2}[-_]\d{2}[-_]\d{2}[-_]\d{2}$",
-        "timestamp_formats": ["%Y-%m-%d-%H-%M-%S", "%Y_%m_%d_%H_%M_%S"],
+        "pattern": (
+            r"^(?:"
+            r"backup-(\d{4}-\d{2}-\d{2}T\d{2}_\d{2}_\d{2})UTC"      # VCF 5.x: backup-2026-04-29T10_52_44UTC
+            r"|backup-(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2})UTC"     # variant with dashes
+            r"|(\d{4}[-_]\d{2}[-_]\d{2}[-_]\d{2}[-_]\d{2}[-_]\d{2})"  # legacy: 2025-04-25-03-00-00
+            r")$"
+        ),
+        "timestamp_formats": [
+            "%Y-%m-%dT%H_%M_%S",
+            "%Y-%m-%dT%H-%M-%S",
+            "%Y-%m-%d-%H-%M-%S",
+            "%Y_%m_%d_%H_%M_%S",
+        ],
+        "recursive": True,
+    },
+
+    # NSX inventory summaries - emitted alongside NSX backups in VCF 5.x.
+    # Files like: inventory-2026-04-29T10_57_04UTC.json
+    "nsx_inventory": {
+        "type": "file",
+        "pattern": r"^inventory-(\d{4}-\d{2}-\d{2}T\d{2}_\d{2}_\d{2})UTC\.json$",
+        "timestamp_formats": ["%Y-%m-%dT%H_%M_%S"],
         "recursive": True,
     },
 
     # SDDC Manager file-based backup.
     # Naming: vcf-backup-<hostname>-<domain-with-dashes>-<YYYY-MM-DD-HH-MM-SS>.tar.gz
-    # e.g.    vcf-backup-sfo-vcf01-sfo-rainpole-io-2025-04-25-03-00-00.tar.gz
+    # The matching .sha256 sidecar file is also covered. Outer alternation
+    # for the extension is non-capturing so only the timestamp is captured.
     "sddc_manager": {
         "type": "file",
-        "pattern": r"^vcf-backup-.+-(\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2})\.tar\.gz$",
+        "pattern": r"^vcf-backup-.+-(\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2})\.(?:tar\.gz|sha256)$",
         "timestamp_formats": ["%Y-%m-%d-%H-%M-%S"],
         "recursive": True,
     },
 
-    # vCenter Server file-based backup (VAMI). Each backup is a folder.
-    # Naming: sn_<ip>M_<version>_<YYYYMMDD>_<HHMMSS>_<base64-ish>=
-    # e.g.    sn_192.168.1.10M_8.0.300000_20250425_030015_KWER6...=
+    # vCenter Server file-based backup (VAMI). Layout observed on real VCF
+    # 5.2.x systems is two levels:
+    #   <root>/sn_<fqdn>/M_<version>_<YYYYMMDD>-<HHMMSS>_/<files>
+    # The timestamp folder we manage is the inner 'M_..._..._' one. Older
+    # vCenter releases stored a flat folder name with everything baked in:
+    #   sn_<ip>M_<version>_<YYYYMMDD>_<HHMMSS>_<base64>=
+    # Both forms are matched. Outer alternation is non-capturing.
     "vcenter": {
         "type": "directory",
-        "pattern": r"^sn_.+_(\d{8})_(\d{6})_.+$",
+        "pattern": (
+            r"^(?:"
+            r"M_.+?_(\d{8})-(\d{6})_?"          # nested: M_8.0.3.00800_20260429-104119_
+            r"|sn_.+?_(\d{8})_(\d{6})_.+"       # legacy flat: sn_<ip>M_..._20250425_030015_<hash>=
+            r")$"
+        ),
         "timestamp_formats": ["%Y%m%d%H%M%S"],
         "recursive": True,
     },
@@ -82,14 +114,14 @@ PRESETS = {
     # VCF 9 Fleet Management backups (Fleet Manager, VCF Identity Broker,
     # VCF Automation). Layout (per Broadcom docs):
     #   vcf/backups/<cluster-name>/<version>/<component-name>/<timestamp>/<file>.tgz
-    # The timestamp folder is what we manage.
+    # The timestamp folder is what we manage. Outer alternation non-capturing.
     "vcf9_fleet": {
         "type": "directory",
         "pattern": (
-            r"^("
-            r"\d{4}-\d{2}-\d{2}[-T_]\d{2}[-:]\d{2}[-:]\d{2}Z?"  # ISO-ish
-            r"|\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}"             # NSX-style
-            r"|\d{8}[-T_]\d{6}"                                 # compact
+            r"^(?:"
+            r"\d{4}-\d{2}-\d{2}[-T_]\d{2}[-:_]\d{2}[-:_]\d{2}(?:UTC|Z)?"  # ISO-ish
+            r"|\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}"                       # NSX-style
+            r"|\d{8}[-T_]\d{6}"                                           # compact
             r")$"
         ),
         "timestamp_formats": [
@@ -97,6 +129,7 @@ PRESETS = {
             "%Y-%m-%dT%H-%M-%S",
             "%Y-%m-%dT%H:%M:%S",
             "%Y-%m-%dT%H:%M:%SZ",
+            "%Y-%m-%dT%H_%M_%S",
             "%Y-%m-%d_%H-%M-%S",
             "%Y%m%d-%H%M%S",
             "%Y%m%dT%H%M%S",
@@ -109,8 +142,8 @@ PRESETS = {
     "generic_timestamp_dir": {
         "type": "directory",
         "pattern": (
-            r"^("
-            r"\d{4}-\d{2}-\d{2}[-T_]\d{2}[-:]\d{2}[-:]\d{2}Z?"
+            r"^(?:"
+            r"\d{4}-\d{2}-\d{2}[-T_]\d{2}[-:_]\d{2}[-:_]\d{2}(?:UTC|Z)?"
             r"|\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}"
             r"|\d{8}[-T_]\d{6}"
             r")$"
@@ -120,6 +153,7 @@ PRESETS = {
             "%Y-%m-%dT%H-%M-%S",
             "%Y-%m-%dT%H:%M:%S",
             "%Y-%m-%dT%H:%M:%SZ",
+            "%Y-%m-%dT%H_%M_%S",
             "%Y%m%d-%H%M%S",
             "%Y%m%dT%H%M%S",
             "%Y%m%d_%H%M%S",

@@ -1,942 +1,110 @@
 # VCF Backup Retention Manager
 
-Cross-platform Python script to manage retention of VMware Cloud Foundation
-backups stored on a Linux or Windows backup server (received via SCP / SFTP /
-SMB). Runs from `cron` on Linux or Task Scheduler on Windows. No external
-dependencies - pure Python 3.8+ standard library.
+Manages retention of VMware Cloud Foundation backups stored on a Linux or
+Windows server (received via SCP / SFTP / SMB). Pure Python 3.8+ standard
+library; no external dependencies for the retention script itself.
 
 Supports the following VCF backup formats out of the box:
 
-| Component | VCF version | Type | Filename / Folder pattern |
+| Component | VCF version | Type | Pattern |
 |---|---|---|---|
-| SDDC Manager | 5.x and 9.x | file | `vcf-backup-<host>-<domain>-<YYYY-MM-DD-HH-MM-SS>.tar.gz` |
-| NSX-T / NSX | 5.x and 9.x | directory | `<root>/cluster-node-backups/<uuid>/<YYYY-MM-DD-HH-MM-SS>/` (and `node-backups`, `cluster-backups`) |
-| vCenter Server (VAMI) | 5.x and 9.x | directory | `sn_<ip>M_<ver>_<YYYYMMDD>_<HHMMSS>_<base64>=` |
-| Fleet Manager / VCF Identity Broker / VCF Automation | 9.x | directory | `vcf/backups/<cluster>/<version>/<component>/<timestamp>/...tgz` |
+| SDDC Manager | 5.x and 9.x | file | `vcf-backup-<host>-<domain>-<YYYY-MM-DD-HH-MM-SS>.tar.gz` (and matching `.sha256`) |
+| NSX-T / NSX | 5.x and 9.x | directory | `<root>/<node-uuid>/backup-<YYYY-MM-DDTHH_MM_SS>UTC/` |
+| NSX inventory summaries | 5.x and 9.x | file | `<root>/<node-uuid>/inventory-<YYYY-MM-DDTHH_MM_SS>UTC.json` |
+| vCenter Server (VAMI) | 5.x and 9.x | directory | `<root>/sn_<fqdn>/M_<version>_<YYYYMMDD>-<HHMMSS>_/` |
+| Fleet Manager / Identity Broker / Automation | 9.x | directory | `vcf/backups/<cluster>/<version>/<component>/<timestamp>/...tgz` |
+
+---
+
+## Table of contents
+
+1. [Quick start](#quick-start)
+2. [Files in this package](#files-in-this-package)
+3. [Configuration wizard](#configuration-wizard)
+4. [Configuration file (JSON) reference](#configuration-file-json-reference)
+5. [Built-in presets](#built-in-presets)
+6. [Custom patterns](#custom-patterns)
+7. [Worked example: real VCF 5.2.x deployment](#worked-example-real-vcf-52x-deployment)
+8. [Installation - Linux](#installation---linux)
+9. [Installation - Windows 10](#installation---windows-10)
+10. [First run, scheduling, monitoring](#first-run-scheduling-monitoring)
+11. [Safety](#safety)
+
+---
 
 ## Quick start
 
-You can either:
-
-1. **Use the configuration wizard** (recommended for most people) - an
-   interactive tool that asks questions and writes the JSON for you.
-   See the [Configuration wizard](#configuration-wizard) section at the
-   end of this document.
-2. **Write the JSON config by hand** using the reference below.
-
-The rest of this document describes the JSON config format and how to run
-the retention script. The wizard is documented at the very end.
-
-## Files
-
-- `vcf_backup_retention.py` - the retention script (no external dependencies)
-- `vcf_retention_wizard.py` - interactive wizard that generates a JSON config
-- `config.json` - example configuration covering VCF 5.2.2 + VCF 9
-- `config-vcf52.json` - example for VCF 5.2.x only
-- `config-vcf9.json` - example for VCF 9.x only
-- `README.md` - this file
-
-## Requirements
-
-- Python 3.8 or later
-- No third-party libraries (only standard library)
-
-Verify Python is available:
+The fastest path:
 
 ```bash
-# Linux
-python3 --version
+# Linux (also fine on macOS)
+pip install colorama
+python3 vcf_retention_wizard.py
+# Choose:  3) Autodetect VCF 5.2.x  (or 4) for VCF 9.x)
+# Point at your top-level backup folder, e.g. /home/backup
+# Confirm what the wizard found
 
-# Windows (PowerShell or cmd)
-python --version
+# Test (no deletes!)
+python3 vcf_backup_retention.py -c vcf-retention-config.json --dry-run --verbose
+
+# Schedule via cron
+sudo crontab -e
+# add: 15 3 * * * /usr/bin/python3 /opt/backup_retention_manager/vcf_backup_retention.py -c /opt/backup_retention_manager/vcf-retention-config.json
 ```
 
-## Configuration (JSON)
-
-```json
-{
-  "log": {
-    "file": "/var/log/vcf-backup-retention.log",
-    "level": "INFO",
-    "max_size_mb": 10,
-    "backup_count": 5
-  },
-  "backup_targets": [
-    {
-      "name": "VCF 5.2.2 - SDDC Manager",
-      "path": "/backup/vcf52/sddc-manager",
-      "preset": "sddc_manager",
-      "min_age_minutes": 60,
-      "retention": { "keep_days": 30, "keep_minimum": 7 }
-    }
-  ]
-}
-```
-
-### Per-target keys
-
-| Key | Required | Default | Description |
-|---|---|---|---|
-| `name` | no | path | Display name shown in the log |
-| `enabled` | no | `true` | Set to `false` to skip this target without deleting it from the config |
-| `path` | yes | - | Root directory to scan |
-| `preset` | no | - | One of `nsx`, `sddc_manager`, `vcenter`, `vcf9_fleet`, `generic_timestamp_dir` |
-| `type` | no | from preset / `directory` | `file` or `directory` |
-| `pattern` | no | from preset | Custom regex applied to file/dir name |
-| `timestamp_formats` | no | from preset | List of `strptime` formats to parse age from name |
-| `recursive` | no | `true` | Walk into subdirectories |
-| `min_age_minutes` | no | `60` | Never touch backups younger than this (protects in-flight uploads) |
-| `retention.keep_days` | one of two | - | Keep backups newer than X days |
-| `retention.keep_count` | one of two | - | Keep the newest N backups (per group) |
-| `retention.keep_minimum` | no | `1` | Always keep at least N most recent backups, even if older than `keep_days` |
-
-You must set at least one of `keep_days` or `keep_count`. They can be combined -
-both rules are evaluated and a backup is kept if either rule says so.
-
-### Retention logic
-
-For every group of backups (one group = one parent folder), evaluated newest first:
-
-1. The newest `keep_minimum` backups are always kept (safety floor).
-2. Backups younger than `min_age_minutes` are always kept (protects in-flight uploads).
-3. If `keep_count` is set, the newest `keep_count` backups are kept.
-4. If `keep_days` is set, any backup with age <= `keep_days` is kept.
-5. Anything else is deleted.
-
-### Per-group retention (per-node, per-component)
-
-The script groups discovered backups by their parent directory and applies
-retention to each group separately. For NSX-T this means each manager node
-keeps its own retention window. For VCF 9 Fleet, each component
-(Fleet Manager / Identity Broker / Automation) gets its own retention.
-
-## Presets - detailed reference
-
-The script ships with five presets covering the most common VCF backup
-formats. A preset is a shortcut: instead of writing the regex, timestamp
-parsing rules, and item type yourself, you set `"preset": "..."` and the
-script fills in the details. List them at any time:
-
-```bash
-python3 vcf_backup_retention.py --list-presets
-```
-
-### File mode vs directory mode
-
-Each target operates in one of two modes (decided by the preset, or by an
-explicit `type` key):
-
-- **`type: "file"`** - the backup is a single file (typically `.tar.gz`,
-  `.tgz`, `.zip`). The pattern matches the **file name**; deletion calls
-  `unlink()` on that file. Size is the file size from `stat()`.
-- **`type: "directory"`** - the backup is a folder containing one or more
-  files. The pattern matches the **folder name**; deletion calls
-  `rmtree()` on the entire folder. Size is the recursive total of all
-  files inside.
-
-Some VCF components write a single archive per backup (file mode); others
-create a folder per backup (directory mode). Custom targets can use either.
-
-### How timestamp parsing works
-
-For every preset and custom pattern, the script extracts the backup's age
-from the file/folder name as follows:
-
-1. Apply the regex to the name.
-2. If the regex contains **capture groups**, concatenate them in order
-   (no separator) - that's the timestamp string.
-3. If the regex has **no capture groups**, the entire matched name is the
-   timestamp string.
-4. Try each format in `timestamp_formats` against the string with
-   `datetime.strptime()`; the first one that succeeds wins.
-5. If none matches, fall back to the file's `mtime`.
-
-This lets one regex pluck the timestamp out of a longer name (like
-`vcf-backup-host-2025-04-25-03-00-00.tar.gz` -> capture group 1 = the
-timestamp), and lets multiple capture groups represent date and time
-separately (like vCenter's `sn_..._20250425_030015_...` -> groups 1+2 =
-`20250425030015`).
+That's it. The rest of this document explains how everything works.
 
 ---
 
-### Preset: `sddc_manager`
-
-- **Mode:** `file`
-- **Used for:** SDDC Manager file-based backups (VCF 5.x and 9.x).
-
-SDDC Manager backs itself up to SFTP as a single encrypted tarball per
-backup, named according to a fixed convention:
-`vcf-backup-<hostname-with-dashes>-<domain-with-dashes>-<YYYY-MM-DD-HH-MM-SS>.tar.gz`.
-
-#### Pattern
-
-```regex
-^vcf-backup-.+-(\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2})\.tar\.gz$
-```
-
-The capture group extracts the timestamp portion, parsed with
-`%Y-%m-%d-%H-%M-%S`.
-
-#### Layout on disk
-
-VCF triggers backups not only on schedule (default daily at 04:02) but
-also after every state change, so multiple files per day are normal:
-
-```
-/backup/vcf52/sddc-manager/
-├── vcf-backup-sfo-vcf01-sfo-rainpole-io-2025-04-23-04-02-00.tar.gz
-├── vcf-backup-sfo-vcf01-sfo-rainpole-io-2025-04-24-04-02-00.tar.gz
-├── vcf-backup-sfo-vcf01-sfo-rainpole-io-2025-04-25-04-02-00.tar.gz
-├── vcf-backup-sfo-vcf01-sfo-rainpole-io-2025-04-25-14-30-22.tar.gz   <- state change
-└── vcf-backup-sfo-vcf01-sfo-rainpole-io-2025-04-26-04-02-00.tar.gz
-```
-
-#### Config
-
-```json
-{
-  "name": "VCF 5.2.2 - SDDC Manager",
-  "enabled": true,
-  "path": "/backup/vcf52/sddc-manager",
-  "preset": "sddc_manager",
-  "retention": {
-    "keep_days": 30,
-    "keep_minimum": 10
-  }
-}
-```
-
-#### What happens
-
-All `.tar.gz` files in the path (recursive) form a single group `<root>`.
-With the config above, files older than 30 days are deleted, but the 10
-newest files are always kept regardless of age.
-
----
-
-### Preset: `nsx`
-
-- **Mode:** `directory`
-- **Used for:** NSX-T / NSX file-based backups (VCF 5.x and 9.x).
-
-NSX runs three kinds of backups (cluster / cluster-node / node) and
-creates a timestamped folder for each. A single SFTP target therefore
-contains three top-level folders, each holding subfolders per node UUID,
-each containing timestamp folders.
-
-#### Pattern
-
-```regex
-^\d{4}[-_]\d{2}[-_]\d{2}[-_]\d{2}[-_]\d{2}[-_]\d{2}$
-```
-
-No capture groups - the whole folder name is the timestamp, parsed as
-`%Y-%m-%d-%H-%M-%S` (with `_` separator as fallback).
-
-#### Layout on disk
-
-```
-/backup/vcf52/nsx/
-├── cluster-backups/
-│   ├── 2025-04-23-03-00-00/
-│   │   └── cluster.tar.gz
-│   ├── 2025-04-24-03-00-00/
-│   └── 2025-04-25-03-00-00/
-├── cluster-node-backups/
-│   ├── abcd1234-...-1234-10.0.0.11/
-│   │   ├── 2025-04-23-03-00-00/
-│   │   ├── 2025-04-24-03-00-00/
-│   │   └── 2025-04-25-03-00-00/
-│   ├── abcd1234-...-5678-10.0.0.12/
-│   │   └── ...
-│   └── abcd1234-...-9abc-10.0.0.13/
-│       └── ...
-└── node-backups/
-    ├── abcd1234-...-1234-10.0.0.11/
-    │   └── ...
-    └── ...
-```
-
-#### Config
-
-```json
-{
-  "name": "VCF 5.2.2 - NSX-T",
-  "enabled": true,
-  "path": "/backup/vcf52/nsx",
-  "preset": "nsx",
-  "retention": {
-    "keep_days": 14,
-    "keep_minimum": 7
-  }
-}
-```
-
-#### What happens
-
-Retention is applied **per parent folder independently** - each NSX node
-and each backup type gets its own pool of N most recent backups. With
-3 NSX managers in a cluster you'll always have at least
-`keep_minimum * 3` (cluster-node) + `keep_minimum * 3` (node) +
-`keep_minimum * 1` (cluster) backups around.
-
-NSX itself does **not** enforce retention on the SFTP side - that's
-exactly why this preset is the most important one to have running.
-
----
-
-### Preset: `vcenter`
-
-- **Mode:** `directory`
-- **Used for:** vCenter Server file-based backups via VAMI (VCF 5.x and 9.x).
-
-vCenter writes each backup as a folder with a long structured name:
-`sn_<ip>M_<version>_<YYYYMMDD>_<HHMMSS>_<base64-ish>=`. Inside the
-folder are the actual backup files.
-
-#### Pattern
-
-```regex
-^sn_.+_(\d{8})_(\d{6})_.+$
-```
-
-Two capture groups: date (`\d{8}`) and time (`\d{6}`). The script
-concatenates them and parses with `%Y%m%d%H%M%S`.
-
-#### Layout on disk
-
-```
-/backup/vcf52/vcenter/
-├── sn_192.168.1.10M_8.0.300000_20250423_030015_KWER6DG...UEf=/
-│   ├── backup-metadata.json
-│   ├── full_backup/
-│   └── ...
-├── sn_192.168.1.10M_8.0.300000_20250424_030022_X7DKL2N...A1S=/
-└── sn_192.168.1.10M_8.0.300000_20250425_030008_R3QWMK7...E4T=/
-```
-
-#### Config
-
-```json
-{
-  "name": "VCF 5.2.2 - vCenter Server",
-  "enabled": true,
-  "path": "/backup/vcf52/vcenter",
-  "preset": "vcenter",
-  "retention": {
-    "keep_days": 30,
-    "keep_minimum": 7
-  }
-}
-```
-
-#### What happens
-
-vCenter itself enforces retention via the VAMI setting "Number of
-backups to retain". This preset is mostly a safety net - keep the
-script's `keep_minimum` at least as high as the VAMI setting so the
-two never disagree.
-
----
-
-### Preset: `vcf9_fleet`
-
-- **Mode:** `directory`
-- **Used for:** VCF 9 Fleet Management backups - Fleet Manager,
-  VCF Identity Broker (VIDB), and VCF Automation (VCFA).
-
-In VCF 9 these three components share a single SFTP root and a structured
-path: `<root>/<cluster-name>/<version>/<component-name>/<timestamp>/<file>.tgz`.
-
-#### Pattern
-
-In the actual JSON the regex is one line; expanded for readability:
-
-```regex
-^(
-   \d{4}-\d{2}-\d{2}[-T_]\d{2}[-:]\d{2}[-:]\d{2}Z?    # ISO-style: 2025-04-25T03-00-00
- | \d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}                # NSX-style: 2025-04-25-03-00-00
- | \d{8}[-T_]\d{6}                                    # compact:   20250425-030015
-)$
-```
-
-The whole timestamp is captured and tried against several `strptime`
-formats in turn (`%Y-%m-%dT%H-%M-%S`, `%Y-%m-%d-%H-%M-%S`,
-`%Y%m%d-%H%M%S`, etc.).
-
-#### Layout on disk
-
-```
-/backup/vcf9/fleet/
-└── cluster-1/
-    └── 9.0.0/
-        ├── fleet-manager/
-        │   ├── 2025-04-23T03-00-00/
-        │   │   └── backup.tgz
-        │   └── 2025-04-25T03-00-00/
-        ├── identity-broker/
-        │   ├── 2025-04-23T03-00-00/
-        │   └── 2025-04-25T03-00-00/
-        └── vcf-automation/
-            ├── 2025-04-23T03-00-00/
-            └── 2025-04-25T03-00-00/
-```
-
-#### Config
-
-```json
-{
-  "name": "VCF 9 - Fleet Management",
-  "enabled": true,
-  "path": "/backup/vcf9/fleet",
-  "preset": "vcf9_fleet",
-  "retention": {
-    "keep_days": 14,
-    "keep_minimum": 5
-  }
-}
-```
-
-#### What happens
-
-Retention is applied **per component independently** (one group per
-component folder). Each timestamp folder is deleted as one unit -
-including the `.tgz` inside it.
-
-VCF 9 has its own retention setting in Fleet Management UI ("Enable
-retention policy"). If that's enabled, this preset is a safety net;
-if not, this preset is your only retention.
-
----
-
-### Preset: `generic_timestamp_dir`
-
-- **Mode:** `directory`
-- **Used for:** anything else with timestamp-named folders.
-
-Same pattern as `vcf9_fleet`, just neutrally named. Useful when:
-
-- You have application backups (non-VCF) using ISO or compact timestamps.
-- You're not sure which preset fits and want to try the most permissive one.
-- You're testing in `--dry-run` mode and want to see what would match.
-
-The same caveats apply: timestamp must be in the folder name; the script
-falls back to `mtime` if it can't parse the name.
-
----
-
-## Installation - Linux
-
-```bash
-sudo mkdir -p /opt/vcf-retention
-sudo cp vcf_backup_retention.py config.json /opt/vcf-retention/
-sudo chmod +x /opt/vcf-retention/vcf_backup_retention.py
-
-# Edit paths and retention values for your environment
-sudo nano /opt/vcf-retention/config.json
-
-# Make sure log directory is writable
-sudo touch /var/log/vcf-backup-retention.log
-sudo chown root:root /var/log/vcf-backup-retention.log
-sudo chmod 640 /var/log/vcf-backup-retention.log
-```
-
-### Linux cron
-
-Add to root's crontab (`sudo crontab -e`):
-
-```cron
-# VCF backup retention - daily at 03:15
-15 3 * * * /usr/bin/python3 /opt/vcf-retention/vcf_backup_retention.py -c /opt/vcf-retention/config.json >/dev/null 2>&1
-```
-
-To get an email only on errors, set `MAILTO=...` at the top of the crontab.
-The script exits with code 1 if any error occurred, 0 otherwise. Pair this
-with `MAILTO` and a non-zero exit will produce mail.
-
-## Installation - Windows 10
-
-```powershell
-# Create installation folder (PowerShell as Administrator)
-New-Item -ItemType Directory -Force -Path "C:\Tools\vcf-retention"
-Copy-Item vcf_backup_retention.py, config.json -Destination "C:\Tools\vcf-retention\"
-
-# Adjust config to use Windows paths
-notepad C:\Tools\vcf-retention\config.json
-```
-
-Example Windows config (paths use forward slashes or escaped backslashes -
-both work with Python's `pathlib`):
-
-```json
-{
-  "log": {
-    "file": "C:/ProgramData/vcf-retention/vcf-backup-retention.log",
-    "level": "INFO",
-    "max_size_mb": 10,
-    "backup_count": 5
-  },
-  "backup_targets": [
-    {
-      "name": "VCF 5.2.2 - SDDC Manager",
-      "path": "D:/backup/vcf52/sddc-manager",
-      "preset": "sddc_manager",
-      "retention": { "keep_days": 30, "keep_minimum": 7 }
-    },
-    {
-      "name": "VCF 5.2.2 - NSX-T",
-      "path": "D:/backup/vcf52/nsx",
-      "preset": "nsx",
-      "retention": { "keep_days": 30, "keep_minimum": 7 }
-    }
-  ]
-}
-```
-
-### Windows Task Scheduler (GUI)
-
-1. Open Task Scheduler.
-2. Action -> Create Task...
-3. **General** tab:
-   - Name: `VCF Backup Retention`
-   - "Run whether user is logged on or not"
-   - "Run with highest privileges"
-4. **Triggers** tab -> New: Daily at 03:15.
-5. **Actions** tab -> New:
-   - Program: `C:\Windows\System32\cmd.exe` (or full path to `python.exe`)
-   - If using cmd: arguments
-     `/c python "C:\Tools\vcf-retention\vcf_backup_retention.py" -c "C:\Tools\vcf-retention\config.json"`
-   - Or call Python directly:
-     - Program: `C:\Python312\python.exe` (or wherever Python is installed)
-     - Arguments: `"C:\Tools\vcf-retention\vcf_backup_retention.py" -c "C:\Tools\vcf-retention\config.json"`
-6. **Conditions / Settings**: leave default or tighten as you wish.
-
-### Windows Task Scheduler (PowerShell, scripted)
-
-```powershell
-$action = New-ScheduledTaskAction `
-    -Execute "python.exe" `
-    -Argument '"C:\Tools\vcf-retention\vcf_backup_retention.py" -c "C:\Tools\vcf-retention\config.json"'
-
-$trigger = New-ScheduledTaskTrigger -Daily -At 3:15am
-
-$principal = New-ScheduledTaskPrincipal `
-    -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
-
-Register-ScheduledTask -TaskName "VCF Backup Retention" `
-    -Action $action -Trigger $trigger -Principal $principal `
-    -Description "Daily retention of VCF backups"
-```
-
-## First run - always dry-run!
-
-The script never deletes anything in dry-run mode. Always run this first
-to see what would happen:
-
-**Linux**
-
-```bash
-sudo python3 /opt/vcf-retention/vcf_backup_retention.py \
-     -c /opt/vcf-retention/config.json --dry-run --verbose
-```
-
-**Windows**
-
-```powershell
-python C:\Tools\vcf-retention\vcf_backup_retention.py `
-     -c C:\Tools\vcf-retention\config.json --dry-run --verbose
-```
-
-The output shows lines like:
-
-```
-[DRY-RUN] Would delete: /backup/vcf52/sddc-manager/vcf-backup-...-2025-01-15-03-00-00.tar.gz
-          (age: 2025-01-15 03:00:00, size: 412.3 MB, reason: older than 30 days ...)
-```
-
-Once you are happy, drop `--dry-run` and let the cron / scheduled task run it.
-
-## Custom patterns (when no preset fits)
-
-You can drop the `preset` key entirely and define `type`, `pattern`, and
-`timestamp_formats` directly on the target. Two important rules for JSON:
-
-1. **Backslashes must be doubled.** `\d` in regex becomes `\\d` in JSON.
-2. **The pattern is matched against the file/dir name only**, not the
-   full path. Don't use `/` separators in `pattern`.
-
-### Custom file mode - examples
-
-#### PostgreSQL pg_dump backups
-
-Two separate number groups in the filename.
-
-```
-/backup/postgres/
-├── prod_db_20250423_030000.sql.gz
-├── prod_db_20250424_030000.sql.gz
-├── prod_db_20250425_030000.sql.gz
-└── prod_db_20250426_030000.sql.gz
-```
-
-```json
-{
-  "name": "PostgreSQL prod_db dumps",
-  "enabled": true,
-  "path": "/backup/postgres",
-  "type": "file",
-  "pattern": "^prod_db_(\\d{8})_(\\d{6})\\.sql\\.gz$",
-  "timestamp_formats": ["%Y%m%d%H%M%S"],
-  "retention": { "keep_days": 60, "keep_minimum": 10 }
-}
-```
-
-The two groups `(\d{8})` and `(\d{6})` are concatenated to
-`20250425030000`, parsed as `%Y%m%d%H%M%S`.
-
-#### Application zip backups with ISO date
-
-Single capture group for the entire timestamp.
-
-```
-/backup/myapp/
-├── myapp-2025-04-23T03-00-00.zip
-├── myapp-2025-04-24T03-00-00.zip
-└── myapp-2025-04-25T03-00-00.zip
-```
-
-```json
-{
-  "name": "MyApp daily zip",
-  "enabled": true,
-  "path": "/backup/myapp",
-  "type": "file",
-  "pattern": "^myapp-(\\d{4}-\\d{2}-\\d{2}T\\d{2}-\\d{2}-\\d{2})\\.zip$",
-  "timestamp_formats": ["%Y-%m-%dT%H-%M-%S"],
-  "retention": { "keep_count": 30, "keep_minimum": 5 }
-}
-```
-
-Here `keep_count: 30` keeps the 30 newest, `keep_minimum: 5` is a safety
-floor (in this scenario `keep_minimum` is redundant because `keep_count`
-already keeps more, but it's good practice to set both).
-
-#### Log archives with date-only timestamp
-
-When the filename contains only a date (no time).
-
-```
-/backup/logs/
-├── logs-2025-04-23.tar.bz2
-├── logs-2025-04-24.tar.bz2
-└── logs-2025-04-25.tar.bz2
-```
-
-```json
-{
-  "name": "Log archives",
-  "enabled": true,
-  "path": "/backup/logs",
-  "type": "file",
-  "pattern": "^logs-(\\d{4}-\\d{2}-\\d{2})\\.tar\\.bz2$",
-  "timestamp_formats": ["%Y-%m-%d"],
-  "retention": { "keep_days": 90, "keep_minimum": 30 }
-}
-```
-
-A date-only timestamp is treated as midnight, which works correctly for
-daily comparisons.
-
-#### Custom prefix + suffix, no preset
-
-Plain `.tgz` archives with a prefix you choose.
-
-```
-/backup/vmware-misc/
-├── nsx-edge-config-2025-04-23-03-00-00.tgz
-├── nsx-edge-config-2025-04-24-03-00-00.tgz
-└── nsx-edge-config-2025-04-25-03-00-00.tgz
-```
-
-```json
-{
-  "name": "NSX edge config exports",
-  "enabled": true,
-  "path": "/backup/vmware-misc",
-  "type": "file",
-  "pattern": "^nsx-edge-config-(\\d{4}-\\d{2}-\\d{2}-\\d{2}-\\d{2}-\\d{2})\\.tgz$",
-  "timestamp_formats": ["%Y-%m-%d-%H-%M-%S"],
-  "retention": { "keep_days": 30, "keep_minimum": 5 }
-}
-```
-
-#### Files where the date is not in the name
-
-If your filename has no parseable date (e.g. `backup-final.tar.gz` or
-`dump_v3.zip`), force the script to use the file's `mtime` as the age
-by giving an empty `timestamp_formats` list:
-
-```json
-{
-  "name": "Random-named backups, age by mtime",
-  "enabled": true,
-  "path": "/backup/scripts",
-  "type": "file",
-  "pattern": "^backup-.+\\.tar\\.gz$",
-  "timestamp_formats": [],
-  "retention": { "keep_days": 30, "keep_minimum": 5 }
-}
-```
-
-Empty `timestamp_formats` ensures parsing fails for every name, and the
-script falls back to each file's modification time. Less reliable than
-parsing from the name, but workable.
-
-#### Multiple file types in the same directory
-
-If the same folder gets multiple types of backups dumped into it, define
-**two targets pointing at the same path**, each matching its own files:
-
-```
-/backup/sftp-shared/
-├── vcf-backup-sfo-vcf01-sfo-rainpole-io-2025-04-25-04-02-00.tar.gz
-├── vcf-backup-sfo-vcf01-sfo-rainpole-io-2025-04-26-04-02-00.tar.gz
-├── nsx-config-export-2025-04-25.zip
-└── nsx-config-export-2025-04-26.zip
-```
-
-```json
-[
-  {
-    "name": "Shared SFTP - SDDC Manager",
-    "enabled": true,
-    "path": "/backup/sftp-shared",
-    "preset": "sddc_manager",
-    "retention": { "keep_days": 30, "keep_minimum": 10 }
-  },
-  {
-    "name": "Shared SFTP - NSX exports",
-    "enabled": true,
-    "path": "/backup/sftp-shared",
-    "type": "file",
-    "pattern": "^nsx-config-export-(\\d{4}-\\d{2}-\\d{2})\\.zip$",
-    "timestamp_formats": ["%Y-%m-%d"],
-    "retention": { "keep_days": 60, "keep_minimum": 7 }
-  }
-]
-```
-
-The two targets see only their own files because the patterns are
-mutually exclusive.
-
-### Custom directory mode - examples
-
-#### Compact-timestamp folders
-
-```
-/backup/myservice/
-├── 20250423-030000/
-│   └── data/
-├── 20250424-030000/
-└── 20250425-030000/
-```
-
-```json
-{
-  "name": "MyService daily folder backups",
-  "enabled": true,
-  "path": "/backup/myservice",
-  "type": "directory",
-  "pattern": "^(\\d{8})-(\\d{6})$",
-  "timestamp_formats": ["%Y%m%d%H%M%S"],
-  "retention": { "keep_days": 14, "keep_minimum": 5 }
-}
-```
-
-### Combining preset + override
-
-If a preset is almost right but you want to tighten one rule, set the
-preset and override individual keys. Per-target keys win over preset values.
-
-For instance, if you only want to manage SDDC Manager backups from one
-specific host (and ignore others in the same folder):
-
-```json
-{
-  "name": "SDDC Manager - sfo-vcf01 only",
-  "enabled": true,
-  "path": "/backup/vcf52/sddc-manager",
-  "preset": "sddc_manager",
-  "pattern": "^vcf-backup-sfo-vcf01-sfo-rainpole-io-(\\d{4}-\\d{2}-\\d{2}-\\d{2}-\\d{2}-\\d{2})\\.tar\\.gz$",
-  "retention": { "keep_days": 30, "keep_minimum": 10 }
-}
-```
-
-The preset still provides `type`, `timestamp_formats`, and `recursive`;
-only `pattern` is overridden.
-
-## Safety
-
-- `keep_minimum` guarantees you never end up with zero backups, even if
-  every backup is older than `keep_days`.
-- `min_age_minutes` protects backups currently being uploaded.
-- `--dry-run` shows actions without performing them.
-- The script refuses to delete any path that:
-  - resolves outside the configured `path`;
-  - matches a known system root (`/`, `/etc`, `/var`, `C:\`, `C:\Windows`, ...);
-  - has fewer than 3 path components.
-
-## Verifying it works
-
-**Linux**
-
-```bash
-tail -f /var/log/vcf-backup-retention.log
-ls -l /var/log/vcf-backup-retention.log*
-```
-
-**Windows**
-
-```powershell
-Get-Content C:\ProgramData\vcf-retention\vcf-backup-retention.log -Wait -Tail 50
-```
-
-Each run ends with a summary block:
-
-```
-########## Run Summary ##########
-  Targets processed : 4
-  Backups scanned   : 235
-  Kept              : 128
-  Deleted           : 107
-  Errors            : 0
-  Space freed       : 12.34 GB
-########## End of Run ##########
-```
+## Files in this package
+
+| File | Purpose |
+|---|---|
+| `vcf_backup_retention.py` | The retention script. No external dependencies. Run it via cron / Task Scheduler. |
+| `vcf_retention_wizard.py` | Interactive wizard that builds the JSON config. Requires `colorama`. |
+| `config.json` | Example config covering both VCF 5.2.x and VCF 9.x |
+| `config-vcf52.json` | Example for VCF 5.2.x only |
+| `config-vcf9.json` | Example for VCF 9.x only |
+| `README.md` | This file |
 
 ---
 
 ## Configuration wizard
 
-If you don't want to write JSON by hand, the package includes an interactive
-wizard (`vcf_retention_wizard.py`) that asks questions and produces a valid
-config file ready for use with `vcf_backup_retention.py`.
+`vcf_retention_wizard.py` is the recommended way to build a config.
 
 ### Requirements
-
-The wizard requires only **`colorama`** (for colored prompts). The retention
-script itself has zero external dependencies; the wizard is the only place
-that needs `colorama`.
 
 ```bash
 pip install colorama
 ```
 
-That's all. No `pyreadline3`, no `prompt_toolkit`, nothing else - editable
-default values are implemented via raw terminal mode (Linux: `termios`;
-Windows: `msvcrt`), both available in the Python standard library.
+That's it. Editable default values in prompts use raw terminal mode
+(`termios` on Linux/macOS, `msvcrt` on Windows) - no extra packages needed.
 
-### Running the wizard
+### Four setup modes
 
-```bash
-# Linux
-python3 vcf_retention_wizard.py
-
-# Windows
-python vcf_retention_wizard.py
-```
-
-Optional: pass `-o` to choose the default output filename:
-
-```bash
-python3 vcf_retention_wizard.py -o config-vcf52.json
-```
-
-### Two setup paths
-
-When the wizard starts it asks which mode you want:
+When the wizard starts:
 
 ```
 Choose a setup mode:
-  1) Simple   - guided setup using built-in VCF presets (recommended)
-  2) Advanced - full control: custom targets, regex patterns, overrides
+  1) Simple    - guided setup using built-in VCF presets (recommended)
+  2) Advanced  - full control: custom targets, regex patterns, overrides
+  3) Autodetect VCF 5.2.x - point at a top folder, wizard finds instances
+  4) Autodetect VCF 9.x   - point at a top folder, wizard finds instances
 ```
 
-#### Simple mode
+**If you already have backups landing on the server, use 3 or 4.** The
+wizard scans the folder, finds your instances, identifies their components,
+and proposes a complete config. You only confirm or adjust.
 
-Guided setup for the standard VCF 5.2.x or VCF 9.x components. Steps:
-
-1. **Pick the VCF version** - either `1) VCF 5.2.x only` or
-   `2) VCF 9.x only`. If you have both, run the wizard twice and either
-   merge the resulting files or keep them as two cron jobs.
-2. **Base backup path** - where backups land on your server. Default
-   `/backup`, editable.
-3. **Log file path** - default `/var/log/vcf-backup-retention.log`,
-   editable.
-4. **Per-component questions** - for each VCF component, the wizard asks:
-   - Manage this component? (Y/n)
-   - Backup path (with a sensible auto-generated default)
-   - Keep backups for how many days
-   - Always keep at least how many newest backups (safety floor)
-
-Components offered:
-
-- VCF 5.2.x: SDDC Manager, NSX-T, vCenter Server
-- VCF 9.x: SDDC Manager, NSX, vCenter Server, Fleet Management
-  (Fleet Manager + Identity Broker + Automation)
-
-The wizard fills in the rest (regex pattern, timestamp parsing, item type)
-from the built-in presets.
-
-#### Advanced mode
-
-Full control. Adds these capabilities on top of simple mode:
-
-- **Logging settings** - log level, max file size, rotation count
-- **Multiple targets** - add one target at a time, then either add another
-  or finish
-- **Preset target with overrides** - pick a preset, then optionally set
-  per-target `min_age_minutes`, mix `keep_days` with `keep_count`,
-  override the regex pattern of the preset
-- **Custom targets** - skip the presets entirely and define everything by
-  hand: type (file or directory), regex pattern, timestamp formats,
-  recursion, retention
-
-When you create a **custom file-mode target**, the wizard shows a catalog
-of common regex patterns to pick from:
-
-```
-Pick a pattern for file names, or write your own:
-  1) Single timestamp like '...-2025-04-25-03-00-00.tar.gz'
-     regex:    ^.+-(\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2})\..+$
-     formats:  %Y-%m-%d-%H-%M-%S
-     matches:  myapp-2025-04-25-03-00-00.tar.gz
-
-  2) Date+time as separate groups like '..._20250425_030000.sql.gz'
-     regex:    ^.+_(\d{8})_(\d{6})\..+$
-     formats:  %Y%m%d%H%M%S
-     matches:  prod_db_20250425_030000.sql.gz
-
-  3) ISO timestamp like '...-2025-04-25T03-00-00.zip'
-  4) Date only like '...-2025-04-25.tar.bz2'
-  5) Compact timestamp like '...20250425-030000.tgz'
-  6) No date in name - use file mtime
-  7) Custom - write your own pattern
-```
-
-After picking, you can either use the pattern as-is or tweak it. Picking
-"Custom" lets you write any regex; the wizard validates that it compiles
-before saving the config.
-
-For **custom directory-mode targets** the wizard offers a smaller catalog
-of timestamp folder patterns (NSX-style, ISO, compact) plus a
-"write your own" option.
+If you are setting up before any backup arrives, use `1` (simple). Use `2`
+(advanced) only when you need non-VCF backups or custom regex.
 
 ### Editable defaults
 
-Everywhere a default value is offered, it is **pre-filled at the cursor**
-so you can press Enter to accept, or use Backspace / typing to edit it
-directly. No need to retype the whole default just to change one character.
+Where a default value is offered, it is **pre-filled at the cursor** so you
+can press Enter to accept, or use Backspace / typing to edit it directly.
 
 ```
 Where on this server do backups land? (base path): /backup█
@@ -954,60 +122,772 @@ Keyboard shortcuts inside an editable prompt:
 | Ctrl-C | Cancel the wizard |
 | Ctrl-D | Cancel (when the line is empty) |
 
-Editable defaults work on Linux, macOS, and Windows 10+ without any extra
-packages. When the wizard runs without a TTY (e.g. piped input for
-automation), it automatically falls back to a `[default]: ` style prompt
-where empty input is treated as "accept default".
+When the wizard runs without a TTY (piped input for automation), it falls
+back to a `[default]: ` prompt where empty input means "accept default".
 
-### After saving
+### Mode 3 / 4: Autodetect
 
-The wizard validates the config and saves it to the path you specify
-(default `vcf-retention-config.json`). It then prints the exact commands
-to run:
+You provide one top-level path (e.g. `/home/backup`). The wizard:
+
+1. Scans subdirectories and identifies which ones look like VCF backup
+   instances. Anything without a recognised backup is reported as
+   "skipped" (typically a freshly set-up environment with no backups
+   yet, or unrelated content like logs).
+2. For each instance, identifies which components are present (SDDC
+   Manager files, NSX backup folders, NSX inventory JSON, vCenter VAMI
+   folders, VCF 9 Fleet folders).
+3. Guesses VCF version per instance from the components found (Fleet
+   present → VCF 9.x, otherwise → VCF 5.2.x).
+4. Asks you to confirm each instance and each component, with sensible
+   default retention values.
+
+#### Example: real /home/backup with 4 instances
 
 ```
-Next steps:
-  1. Test (no deletes):  python3 vcf_backup_retention.py -c config.json --dry-run --verbose
-  2. Run live:           python3 vcf_backup_retention.py -c config.json
-  3. Schedule via cron (Linux) or Task Scheduler (Windows).
-     See README.md for details.
+Scanning /home/backup ...
+  Skipped 2 subdir(s) with no recognised backups:
+    - x-vcf  (empty or no recognised content - maybe newly set up?)
+    - x-vcf-t  (empty or no recognised content - maybe newly set up?)
+
+  Found 4 candidate instance(s):
+    b-vcf   VCF 5.2.x  (sddc_manager, nsx, nsx_inventory, vcenter)
+    c-vcf   VCF 5.2.x  (sddc_manager, nsx, nsx_inventory, vcenter)
+    m-vcf   VCF 5.2.x  (sddc_manager, nsx, nsx_inventory, vcenter)
+    u-vcf   VCF 5.2.x  (sddc_manager, nsx, vcenter)
 ```
 
-Always run with `--dry-run --verbose` first to confirm the wizard's output
-matches what you actually want before scheduling it.
+Note that `u-vcf` was correctly detected as having no `inventory-summary`
+yet - the wizard skips that component for it.
 
-### Editing a wizard-generated config later
+Resulting target names get an instance prefix so you can tell them apart
+in logs:
 
-The output is plain JSON; you can open it in any editor and tweak any value
-by hand later. To adjust retention numbers, re-add a target you previously
-declined, or temporarily disable a target, just edit the file - the wizard
-isn't required for changes.
+```
+[b-vcf] VCF 5.2.x - SDDC Manager (.tar.gz files)
+[b-vcf] VCF 5.2.x - NSX-T (timestamped folders)
+[c-vcf] VCF 5.2.x - SDDC Manager (.tar.gz files)
+...
+```
 
-To keep a target permanently in the file but skip it during runs, set
-`"enabled": false`:
+#### How detection works
+
+- **An instance** is an immediate subdirectory that contains at least
+  one item (file or folder, possibly several levels deep) matching one
+  of the built-in presets. Empty subdirectories or unrelated content
+  are reported but skipped.
+- **A component** is detected by checking conventional subfolder names
+  first (`sddc-manager-backup`, `cluster-node-backups`, `inventory-summary`,
+  `vCenter`, `fleet`); if a hint matches, that subfolder becomes the
+  target's `path`. Otherwise, the whole instance directory is used (the
+  retention script searches recursively at runtime).
+- **VCF version** is guessed: if `vcf9_fleet` is present, the instance
+  is VCF 9.x; otherwise VCF 5.2.x. If your autodetect mode does not
+  match the detected version, the wizard prints a warning before asking
+  you to include or skip the instance.
+
+### Mode 1: Simple
+
+Guided setup with multi-instance support. Steps:
+
+1. (Optionally) load an existing config to add more instances to it.
+2. Log file path.
+3. **For each instance:**
+   - Pick the VCF version (5.2.x or 9.x).
+   - Provide an instance label (e.g. `b-vcf`, `prod`).
+   - Provide the SFTP root path (default `/home/backup/<label>`).
+   - For each component: include? path? keep_days? keep_minimum?
+4. "Add another instance?" — repeat as many times as needed.
+
+### Mode 2: Advanced
+
+Full control:
+
+- Optionally load an existing config to add more targets to it.
+- Logging settings (level, max file size, rotation count).
+- Add targets one at a time:
+  - **Preset target**: pick a preset, optionally override `pattern`,
+    `min_age_minutes`, mix `keep_days` with `keep_count`.
+  - **Custom target**: define everything by hand - `type` (file or
+    directory), regex `pattern`, `timestamp_formats`, `recursive`,
+    retention. For file mode, the wizard offers a catalog of common
+    regex patterns (PostgreSQL dumps, ISO timestamps, date-only
+    filenames, mtime fallback, etc.) to pick from or adapt.
+
+### Re-running the wizard with an existing config
+
+All four modes can load an existing config and append to it:
+
+```
+Start from an existing config (to add more instances to it)? [y/N]: y
+Path to existing config: /opt/backup_retention_manager/vcf-retention-config.json
+```
+
+In autodetect modes, components already in the loaded config are
+**deduplicated** automatically:
+
+```
+Found 4 candidate instance(s):
+    b-vcf   VCF 5.2.x  (...)  [4 already in config]
+    c-vcf   VCF 5.2.x  (...)  [4 already in config]
+    u-vcf   VCF 5.2.x  (sddc_manager, nsx, nsx_inventory, vcenter)  [3 already in config]
+
+  --- Instance: u-vcf ---
+  Component: NSX inventory summaries (inventory-*.json)
+  Detected at: /home/backup/u-vcf/inventory-summary
+  Include this component? [Y/n]:
+  ...
+```
+
+Only new components are added; nothing already present is duplicated.
+This makes incremental setup easy - run the wizard once on day 1, run it
+again later when more components arrive, and only the diff is asked
+about.
+
+### Troubleshooting
+
+- **"Value cannot be empty."** - you pressed Enter on a prompt that
+  required input (a name with no default). Type a value.
+- **"'foo' is not a valid integer."** - re-enter a number.
+- **Cursor stays at start, can't see default** - your terminal does
+  not support raw mode (rare). The wizard falls back to `[default]: `
+  prompts; press Enter to accept or type a new value.
+- **Coloured output looks like garbage** (`\x1b[1;36m...`) - either
+  your terminal does not render ANSI (rare on modern Windows 10+ and
+  any Linux terminal) or `colorama` is not installed.
+- **Wizard exits with `Cancelled by user.`** - you pressed Ctrl-C
+  or Ctrl-D. No file is saved.
+
+---
+
+## Configuration file (JSON) reference
+
+The retention script reads a JSON config that looks like this:
 
 ```json
 {
-  "name": "VCF 5.2.x - vCenter Server",
+  "log": {
+    "file": "/var/log/vcf-backup-retention.log",
+    "level": "INFO",
+    "max_size_mb": 10,
+    "backup_count": 5
+  },
+  "backup_targets": [
+    {
+      "name": "VCF 5.2.x - SDDC Manager",
+      "enabled": true,
+      "path": "/home/backup/b-vcf/sddc-manager-backup",
+      "preset": "sddc_manager",
+      "min_age_minutes": 60,
+      "retention": {
+        "keep_days": 30,
+        "keep_minimum": 10
+      }
+    }
+  ]
+}
+```
+
+### Per-target keys
+
+| Key | Required | Default | Description |
+|---|---|---|---|
+| `name` | no | path | Display name shown in the log |
+| `enabled` | no | `true` | Set to `false` to skip this target without removing it from the config |
+| `path` | yes | - | Root directory to scan |
+| `preset` | no | - | One of `sddc_manager`, `nsx`, `nsx_inventory`, `vcenter`, `vcf9_fleet`, `generic_timestamp_dir` |
+| `type` | no | from preset / `directory` | `file` or `directory` (overrides preset) |
+| `pattern` | no | from preset | Custom regex applied to file/dir name (overrides preset) |
+| `timestamp_formats` | no | from preset | List of `strptime` formats to parse age from name |
+| `recursive` | no | `true` | Walk into subdirectories |
+| `min_age_minutes` | no | `60` | Never touch backups younger than this (protects in-flight uploads) |
+| `retention.keep_days` | one of two | - | Keep backups newer than X days |
+| `retention.keep_count` | one of two | - | Keep the newest N backups (per group) |
+| `retention.keep_minimum` | no | `1` | Always keep at least N most recent backups, even if older than `keep_days` |
+
+You must set at least one of `keep_days` or `keep_count`. They can be
+combined - both rules are evaluated and a backup is kept if either rule
+says so.
+
+### Retention logic
+
+For every group of backups (one group = one parent folder), evaluated
+newest first:
+
+1. The newest `keep_minimum` backups are always kept (safety floor).
+2. Backups younger than `min_age_minutes` are always kept (protects
+   in-flight uploads).
+3. If `keep_count` is set, the newest `keep_count` backups are kept.
+4. If `keep_days` is set, any backup with age ≤ `keep_days` is kept.
+5. Anything else is deleted.
+
+### Per-group retention
+
+The script groups discovered backups by their parent directory and
+applies retention to each group separately. For NSX, this means each
+manager node UUID keeps its own retention window. For VCF 9 Fleet,
+each component (Fleet Manager / Identity Broker / Automation) gets
+its own retention. You don't need to configure this per node - it's
+automatic.
+
+### `enabled: false`
+
+To temporarily skip a target without removing it from the config:
+
+```json
+{
+  "name": "VCF 5.2.x - vCenter Server (under maintenance)",
   "enabled": false,
   ...
 }
 ```
 
-This is documented under [Per-target keys](#per-target-keys) above.
+The script logs `--- Skipping disabled target: ... ---` and adds
+`Targets skipped: N` to the run summary.
 
-### Troubleshooting the wizard
+---
 
-- **"Value cannot be empty."** - you pressed Enter on a prompt that
-  required input (a name or path with no default). Type a value.
-- **"'foo' is not a valid integer."** - re-enter a number.
-- **Cursor stays at start, can't see default** - your terminal doesn't
-  support raw mode, or stdin/stdout aren't a TTY (running under some IDEs
-  or remote shells). The wizard falls back to `[default]: ` mode in that
-  case; just press Enter to accept or type a new value.
-- **Colored output looks like garbage** (`\x1b[1;36m...`) - either your
-  terminal doesn't render ANSI (rare on modern Windows 10+ and any Linux
-  terminal) or `colorama` isn't installed. Install with
-  `pip install colorama`.
-- **Wizard exits with `Cancelled by user.`** - you pressed Ctrl-C or
-  Ctrl-D, or hit EOF on piped input. No file is saved.
+## Built-in presets
+
+A preset predefines `type`, `pattern`, `timestamp_formats`, and
+`recursive` for a known VCF backup format. List them with:
+
+```bash
+python3 vcf_backup_retention.py --list-presets
+```
+
+### File mode vs directory mode
+
+- **`type: "file"`** - the backup is a single file (`.tar.gz`,
+  `.tgz`, `.zip`, `.json`). Pattern matches the **file name**;
+  deletion calls `unlink()`.
+- **`type: "directory"`** - the backup is a folder containing one or
+  more files. Pattern matches the **folder name**; deletion calls
+  `rmtree()` on the entire folder.
+
+### How timestamp parsing works
+
+For every preset and custom pattern, age is extracted from the
+file/folder name as follows:
+
+1. Apply the regex to the name.
+2. If the regex contains capture groups, concatenate them in order
+   (no separator) - that's the timestamp string.
+3. If the regex has no capture groups, the entire matched name is
+   the timestamp string.
+4. Try each format in `timestamp_formats` against the string; the
+   first that succeeds wins.
+5. If none matches, fall back to the file's `mtime`.
+
+This lets one regex pluck the timestamp out of a longer name (like
+`vcf-backup-host-2025-04-25-03-00-00.tar.gz` - capture group 1 = the
+timestamp), and lets multiple groups represent date and time
+separately (like vCenter's `M_..._20260429-104119_` - groups 1+2 =
+`20260429104119`).
+
+### Preset: `sddc_manager`
+
+- **Mode:** `file`
+- **For:** SDDC Manager file-based backups (VCF 5.x and 9.x).
+
+Files: `vcf-backup-<host>-<domain>-<YYYY-MM-DD-HH-MM-SS>.tar.gz` plus
+matching `.sha256` sidecar. Both extensions are managed together, so a
+backup is never left as an orphan checksum.
+
+```regex
+^vcf-backup-.+-(\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2})\.(?:tar\.gz|sha256)$
+```
+
+```
+/home/backup/b-vcf/sddc-manager-backup/
+├── vcf-backup-b-w01-mg01-infra-pcr-cz-2026-04-29-10-53-30.tar.gz
+├── vcf-backup-b-w01-mg01-infra-pcr-cz-2026-04-29-10-53-30.sha256
+├── vcf-backup-b-w01-mg01-infra-pcr-cz-2026-04-29-11-00-45.tar.gz
+└── vcf-backup-b-w01-mg01-infra-pcr-cz-2026-04-29-11-00-45.sha256
+```
+
+### Preset: `nsx`
+
+- **Mode:** `directory`
+- **For:** NSX-T / NSX backups (VCF 5.x and 9.x).
+
+Folders: `backup-<YYYY-MM-DDTHH_MM_SS>UTC/` under each node UUID
+directory. The preset also accepts the older `<YYYY-MM-DD-HH-MM-SS>`
+format used by VCF 4.x and earlier.
+
+```regex
+^(?:
+   backup-(\d{4}-\d{2}-\d{2}T\d{2}_\d{2}_\d{2})UTC
+ | backup-(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2})UTC
+ | (\d{4}[-_]\d{2}[-_]\d{2}[-_]\d{2}[-_]\d{2}[-_]\d{2})
+)$
+```
+
+```
+/home/backup/b-vcf/cluster-node-backups/
+├── 4.2.3.3.0...-78141442-...-10.13.48.22/
+│   ├── backup-2026-04-27T10_52_44UTC/
+│   ├── backup-2026-04-28T10_52_44UTC/
+│   └── backup-2026-04-29T10_52_44UTC/
+└── 4.2.3.3.0...-d5bf1442-...-10.13.48.23/
+    ├── backup-2026-04-27T10_52_44UTC/
+    └── backup-2026-04-28T10_52_44UTC/
+```
+
+Retention is applied **per node UUID independently** - 3 NSX managers
+in a cluster always have at least `keep_minimum × 3` backups around.
+Each `backup-...UTC/` folder is deleted as one unit (with all its
+contents).
+
+NSX itself does **not** enforce retention on the SFTP side - this
+preset is the most important one to have running.
+
+### Preset: `nsx_inventory`
+
+- **Mode:** `file`
+- **For:** NSX inventory JSON summaries emitted alongside backups
+  (VCF 5.x and 9.x).
+
+Files: `inventory-<YYYY-MM-DDTHH_MM_SS>UTC.json` under each node UUID.
+
+```regex
+^inventory-(\d{4}-\d{2}-\d{2}T\d{2}_\d{2}_\d{2})UTC\.json$
+```
+
+```
+/home/backup/b-vcf/inventory-summary/
+└── 4.2.3.3.0...-78141442-...-10.13.48.22/
+    ├── inventory-2026-04-27T10_57_04UTC.json
+    ├── inventory-2026-04-28T10_57_04UTC.json
+    └── inventory-2026-04-29T10_57_04UTC.json
+```
+
+Use the same `keep_days` / `keep_minimum` as your `nsx` target so the
+two stay in sync.
+
+### Preset: `vcenter`
+
+- **Mode:** `directory`
+- **For:** vCenter Server file-based backups via VAMI (VCF 5.x and 9.x).
+
+VCF 5.2.x layout (two-level): `<root>/sn_<fqdn>/M_<version>_<YYYYMMDD>-<HHMMSS>_/`.
+The preset matches the inner timestamp folder. The legacy flat form
+(`sn_<ip>M_..._<date>_<time>_<hash>=`) is also accepted.
+
+```regex
+^(?:
+   M_.+?_(\d{8})-(\d{6})_?
+ | sn_.+?_(\d{8})_(\d{6})_.+
+)$
+```
+
+```
+/home/backup/b-vcf/vCenter/
+└── sn_b-w01-vc01.infra.pcr.cz/
+    ├── M_8.0.3.00800_20260427-104119_/
+    ├── M_8.0.3.00800_20260428-104119_/
+    └── M_8.0.3.00800_20260429-104119_/
+```
+
+vCenter has its own retention setting in VAMI. This preset is mostly a
+safety net - keep `keep_minimum` at least as high as the VAMI setting
+so the two never disagree.
+
+### Preset: `vcf9_fleet`
+
+- **Mode:** `directory`
+- **For:** VCF 9 Fleet Management backups (Fleet Manager,
+  VCF Identity Broker, VCF Automation).
+
+Layout: `<root>/<cluster>/<version>/<component>/<timestamp>/<file>.tgz`.
+The preset matches the timestamp folder. Retention is per-component
+automatically.
+
+### Preset: `generic_timestamp_dir`
+
+- **Mode:** `directory`
+- **For:** anything else with timestamp-named folders.
+
+Useful for non-VCF application backups that follow ISO or compact
+timestamp conventions, or as a quick test in `--dry-run` mode.
+
+---
+
+## Custom patterns
+
+Drop the `preset` key entirely and define `type`, `pattern`, and
+`timestamp_formats` directly. Two important rules for JSON:
+
+1. **Backslashes must be doubled.** `\d` in regex becomes `\\d` in JSON.
+2. **The pattern is matched against the file/dir name only**, not the
+   full path. Don't use `/` separators in `pattern`.
+
+### File mode examples
+
+#### PostgreSQL pg_dump backups
+
+```
+/backup/postgres/
+├── prod_db_20260427_030000.sql.gz
+├── prod_db_20260428_030000.sql.gz
+└── prod_db_20260429_030000.sql.gz
+```
+
+```json
+{
+  "name": "PostgreSQL prod_db dumps",
+  "enabled": true,
+  "path": "/backup/postgres",
+  "type": "file",
+  "pattern": "^prod_db_(\\d{8})_(\\d{6})\\.sql\\.gz$",
+  "timestamp_formats": ["%Y%m%d%H%M%S"],
+  "retention": { "keep_days": 60, "keep_minimum": 10 }
+}
+```
+
+#### Application zip with ISO timestamp
+
+```json
+{
+  "name": "MyApp daily zip",
+  "enabled": true,
+  "path": "/backup/myapp",
+  "type": "file",
+  "pattern": "^myapp-(\\d{4}-\\d{2}-\\d{2}T\\d{2}-\\d{2}-\\d{2})\\.zip$",
+  "timestamp_formats": ["%Y-%m-%dT%H-%M-%S"],
+  "retention": { "keep_count": 30, "keep_minimum": 5 }
+}
+```
+
+#### Date-only filenames
+
+```json
+{
+  "name": "Log archives",
+  "enabled": true,
+  "path": "/backup/logs",
+  "type": "file",
+  "pattern": "^logs-(\\d{4}-\\d{2}-\\d{2})\\.tar\\.bz2$",
+  "timestamp_formats": ["%Y-%m-%d"],
+  "retention": { "keep_days": 90, "keep_minimum": 30 }
+}
+```
+
+#### No date in filename - use mtime
+
+```json
+{
+  "name": "Random-named backups, age by mtime",
+  "enabled": true,
+  "path": "/backup/scripts",
+  "type": "file",
+  "pattern": "^backup-.+\\.tar\\.gz$",
+  "timestamp_formats": [],
+  "retention": { "keep_days": 30, "keep_minimum": 5 }
+}
+```
+
+Empty `timestamp_formats` ensures parsing fails for every name, and
+the script falls back to each file's modification time.
+
+#### Multiple file types in one folder
+
+If the same folder receives several types of backups, define **two
+targets pointing at the same path**, each with its own pattern:
+
+```json
+[
+  {
+    "name": "Shared SFTP - SDDC Manager",
+    "path": "/backup/sftp-shared",
+    "preset": "sddc_manager",
+    "retention": { "keep_days": 30, "keep_minimum": 10 }
+  },
+  {
+    "name": "Shared SFTP - NSX exports",
+    "path": "/backup/sftp-shared",
+    "type": "file",
+    "pattern": "^nsx-config-export-(\\d{4}-\\d{2}-\\d{2})\\.zip$",
+    "timestamp_formats": ["%Y-%m-%d"],
+    "retention": { "keep_days": 60, "keep_minimum": 7 }
+  }
+]
+```
+
+Each target sees only its own files because the patterns are mutually
+exclusive.
+
+### Directory mode examples
+
+#### Compact-timestamp folders
+
+```json
+{
+  "name": "MyService daily folder backups",
+  "enabled": true,
+  "path": "/backup/myservice",
+  "type": "directory",
+  "pattern": "^(\\d{8})-(\\d{6})$",
+  "timestamp_formats": ["%Y%m%d%H%M%S"],
+  "retention": { "keep_days": 14, "keep_minimum": 5 }
+}
+```
+
+### Combining preset + override
+
+Use a preset and override individual keys. Per-target keys win over
+preset values.
+
+```json
+{
+  "name": "SDDC Manager - sfo-vcf01 only",
+  "enabled": true,
+  "path": "/backup/vcf52/sddc-manager",
+  "preset": "sddc_manager",
+  "pattern": "^vcf-backup-sfo-vcf01-sfo-rainpole-io-(\\d{4}-\\d{2}-\\d{2}-\\d{2}-\\d{2}-\\d{2})\\.(?:tar\\.gz|sha256)$",
+  "retention": { "keep_days": 30, "keep_minimum": 10 }
+}
+```
+
+The preset still provides `type`, `timestamp_formats`, and `recursive`;
+only `pattern` is overridden.
+
+---
+
+## Worked example: real VCF 5.2.x deployment
+
+A production VCF 5.2.x backup server with 4 active instances:
+
+```
+/home/backup/
+├── b-vcf/                             # active, all 4 components
+│   ├── cluster-node-backups/
+│   ├── inventory-summary/
+│   ├── sddc-manager-backup/
+│   └── vCenter/
+├── c-vcf/                             # same
+├── m-vcf/                             # same
+├── u-vcf/                             # active, no inventory yet
+│   ├── cluster-node-backups/
+│   ├── sddc-manager-backup/
+│   └── vCenter/
+├── x-vcf/                             # newly set up, empty
+└── x-vcf-t/                           # newly set up, empty
+```
+
+Build the config in one shot:
+
+```bash
+python3 vcf_retention_wizard.py
+# 3) Autodetect VCF 5.2.x
+# n (don't load existing)
+# /var/log/vcf-backup-retention.log
+# /home/backup
+```
+
+The wizard reports:
+
+```
+Skipped 2 subdir(s) with no recognised backups:
+  - x-vcf  (empty or no recognised content - maybe newly set up?)
+  - x-vcf-t  (empty or no recognised content - maybe newly set up?)
+
+Found 4 candidate instance(s):
+  b-vcf   VCF 5.2.x  (sddc_manager, nsx, nsx_inventory, vcenter)
+  c-vcf   VCF 5.2.x  (sddc_manager, nsx, nsx_inventory, vcenter)
+  m-vcf   VCF 5.2.x  (sddc_manager, nsx, nsx_inventory, vcenter)
+  u-vcf   VCF 5.2.x  (sddc_manager, nsx, vcenter)
+```
+
+After confirming everything with default values: **15 targets** in the
+config (4+4+4+3). Live `--dry-run` output:
+
+```
+[INFO] === Processing target: [b-vcf] VCF 5.2.x - SDDC Manager (.tar.gz files) ===
+[INFO]   Found 4 file(s) matching pattern
+[DEBUG]   KEEP [1]: vcf-backup-b-w01-mg01-...2026-04-29-11-00-45.tar.gz   (minimum)
+[DEBUG]   KEEP [2]: vcf-backup-b-w01-mg01-...2026-04-29-11-00-45.sha256   (minimum)
+...
+[INFO] === Processing target: [b-vcf] VCF 5.2.x - NSX-T (timestamped folders) ===
+[INFO]   Found 1 directory(s) matching pattern
+[INFO]   Group '4.2.3.3.0...-78141442-...': 1 backups
+[DEBUG]   KEEP [1]: backup-2026-04-29T10_52_44UTC   (minimum)
+...
+[INFO] ########## Run Summary ##########
+[INFO]   Targets processed : 15
+[INFO]   Backups scanned   : 22
+[INFO]   Kept              : 22
+[INFO]   Deleted           : 0
+[INFO]   Errors            : 0
+```
+
+When more components arrive (e.g. `u-vcf` gets its first
+`inventory-summary`, or `x-vcf` starts receiving backups), re-run the
+wizard with **load existing** to add only the diff:
+
+```
+Found 5 candidate instance(s):
+  b-vcf   VCF 5.2.x  (...)  [4 already in config]
+  c-vcf   VCF 5.2.x  (...)  [4 already in config]
+  m-vcf   VCF 5.2.x  (...)  [4 already in config]
+  u-vcf   VCF 5.2.x  (sddc_manager, nsx, nsx_inventory, vcenter)  [3 already in config]
+  x-vcf   VCF 5.2.x  (sddc_manager, ...)
+
+  --- Instance: u-vcf ---
+  Component: NSX inventory summaries (inventory-*.json)
+  ...
+```
+
+Only new components get prompts.
+
+---
+
+## Installation - Linux
+
+```bash
+sudo mkdir -p /opt/backup_retention_manager
+sudo cp vcf_backup_retention.py vcf_retention_wizard.py \
+        /opt/backup_retention_manager/
+sudo chmod +x /opt/backup_retention_manager/vcf_backup_retention.py
+
+# (optional - the wizard needs colorama, the retention script does not)
+sudo pip3 install colorama
+
+# Generate or copy the config
+cd /opt/backup_retention_manager
+sudo python3 vcf_retention_wizard.py
+# … saves vcf-retention-config.json next to the scripts
+
+# Make sure the log directory is writable
+sudo touch /var/log/vcf-backup-retention.log
+sudo chown root:root /var/log/vcf-backup-retention.log
+sudo chmod 640 /var/log/vcf-backup-retention.log
+```
+
+---
+
+## Installation - Windows 10
+
+```powershell
+# As Administrator
+New-Item -ItemType Directory -Force -Path "C:\Tools\vcf-retention"
+Copy-Item vcf_backup_retention.py, vcf_retention_wizard.py `
+          -Destination "C:\Tools\vcf-retention\"
+
+# colorama is needed only by the wizard
+pip install colorama
+
+cd C:\Tools\vcf-retention
+python vcf_retention_wizard.py
+```
+
+Example Windows config (paths use forward slashes; `pathlib` accepts
+both styles):
+
+```json
+{
+  "log": {
+    "file": "C:/ProgramData/vcf-retention/vcf-backup-retention.log",
+    "level": "INFO"
+  },
+  "backup_targets": [
+    {
+      "name": "VCF 5.2.x - SDDC Manager",
+      "enabled": true,
+      "path": "D:/backup/b-vcf/sddc-manager-backup",
+      "preset": "sddc_manager",
+      "retention": { "keep_days": 30, "keep_minimum": 10 }
+    }
+  ]
+}
+```
+
+---
+
+## First run, scheduling, monitoring
+
+### Always dry-run first
+
+```bash
+# Linux
+python3 vcf_backup_retention.py -c vcf-retention-config.json --dry-run --verbose
+
+# Windows
+python vcf_backup_retention.py -c vcf-retention-config.json --dry-run --verbose
+```
+
+The output shows lines like:
+
+```
+[DRY-RUN] Would delete: /home/backup/b-vcf/sddc-manager-backup/vcf-backup-...-2026-04-15-...tar.gz
+          (age: 2026-04-15 03:00:00, size: 412.3 MB, reason: older than 30 days ...)
+```
+
+Once you are happy, drop `--dry-run`.
+
+### Linux cron
+
+```cron
+# /etc/crontab or root's crontab (sudo crontab -e)
+MAILTO=admin@example.com
+15 3 * * * /usr/bin/python3 /opt/backup_retention_manager/vcf_backup_retention.py -c /opt/backup_retention_manager/vcf-retention-config.json
+```
+
+The script exits with code 1 when any error occurs, 0 otherwise.
+Combined with `MAILTO`, you only get e-mail when something needs your
+attention.
+
+### Windows Task Scheduler (PowerShell)
+
+```powershell
+$action = New-ScheduledTaskAction `
+    -Execute "python.exe" `
+    -Argument '"C:\Tools\vcf-retention\vcf_backup_retention.py" -c "C:\Tools\vcf-retention\vcf-retention-config.json"'
+$trigger = New-ScheduledTaskTrigger -Daily -At 3:15am
+$principal = New-ScheduledTaskPrincipal `
+    -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+
+Register-ScheduledTask -TaskName "VCF Backup Retention" `
+    -Action $action -Trigger $trigger -Principal $principal `
+    -Description "Daily retention of VCF backups"
+```
+
+### Verifying it works
+
+```bash
+tail -f /var/log/vcf-backup-retention.log
+ls -l /var/log/vcf-backup-retention.log*
+```
+
+Each run ends with a summary block:
+
+```
+########## Run Summary ##########
+  Targets processed : 15
+  Targets skipped   : 0
+  Backups scanned   : 235
+  Kept              : 128
+  Deleted           : 107
+  Errors            : 0
+  Space freed       : 12.34 GB
+########## End of Run ##########
+```
+
+---
+
+## Safety
+
+- **`keep_minimum`** guarantees you never end up with zero backups,
+  even if every backup is older than `keep_days`.
+- **`min_age_minutes`** (default 60) protects backups currently being
+  uploaded.
+- **`--dry-run`** shows actions without performing them.
+- **Path sanity check** - the script refuses to delete any path that:
+  - resolves outside the configured `path`
+  - matches a known system root (`/`, `/etc`, `/var`, `C:\`,
+    `C:\Windows`, ...)
+  - has fewer than 3 path components
+- **`enabled: false`** lets you disable a target without removing it,
+  useful while diagnosing problems.
+
+If a deletion is refused for safety reasons, the log shows
+`SAFETY REFUSED: ...` and `Errors` in the summary increments.

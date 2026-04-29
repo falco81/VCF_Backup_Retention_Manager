@@ -68,32 +68,36 @@ IS_WINDOWS = (os.name == "nt")
 # Components per VCF version (preset name + display label)
 COMPONENTS = {
     "vcf52": [
-        ("sddc_manager", "SDDC Manager (.tar.gz files)"),
-        ("nsx",          "NSX-T (timestamped folders)"),
-        ("vcenter",      "vCenter Server (VAMI sn_... folders)"),
+        ("sddc_manager",   "SDDC Manager (.tar.gz files)"),
+        ("nsx",            "NSX-T (timestamped folders)"),
+        ("nsx_inventory",  "NSX inventory summaries (inventory-*.json)"),
+        ("vcenter",        "vCenter Server (VAMI)"),
     ],
     "vcf9": [
-        ("sddc_manager", "SDDC Manager (.tar.gz files)"),
-        ("nsx",          "NSX (timestamped folders)"),
-        ("vcenter",      "vCenter Server (VAMI sn_... folders)"),
-        ("vcf9_fleet",   "Fleet Mgmt (Fleet Manager + Identity Broker + Automation)"),
+        ("sddc_manager",   "SDDC Manager (.tar.gz files)"),
+        ("nsx",            "NSX (timestamped folders)"),
+        ("nsx_inventory",  "NSX inventory summaries (inventory-*.json)"),
+        ("vcenter",        "vCenter Server (VAMI)"),
+        ("vcf9_fleet",     "Fleet Mgmt (Fleet Manager + Identity Broker + Automation)"),
     ],
 }
 
 # Default retention values per preset (sensible starting points)
 DEFAULT_RETENTION = {
-    "sddc_manager": {"keep_days": 30, "keep_minimum": 10},
-    "nsx":          {"keep_days": 14, "keep_minimum": 7},
-    "vcenter":      {"keep_days": 30, "keep_minimum": 7},
-    "vcf9_fleet":   {"keep_days": 14, "keep_minimum": 5},
+    "sddc_manager":  {"keep_days": 30, "keep_minimum": 10},
+    "nsx":           {"keep_days": 14, "keep_minimum": 7},
+    "nsx_inventory": {"keep_days": 14, "keep_minimum": 7},
+    "vcenter":       {"keep_days": 30, "keep_minimum": 7},
+    "vcf9_fleet":    {"keep_days": 14, "keep_minimum": 5},
 }
 
 # Default folder name suggestions per preset
 DEFAULT_SUBPATH = {
-    "sddc_manager": "sddc-manager",
-    "nsx":          "nsx",
-    "vcenter":      "vcenter",
-    "vcf9_fleet":   "fleet",
+    "sddc_manager":  "sddc-manager-backup",
+    "nsx":           "cluster-node-backups",
+    "nsx_inventory": "inventory-summary",
+    "vcenter":       "vCenter",
+    "vcf9_fleet":    "fleet",
 }
 
 # Examples shown for custom file-mode patterns
@@ -192,6 +196,130 @@ def section(title: str):
     print()
     print(c_header(f"--- {title} ---"))
     print()
+
+
+# ---------------------------------------------------------------------------
+# Autodetection
+# ---------------------------------------------------------------------------
+# Walk a top-level directory and try to identify VCF instances + which
+# components each instance holds. Detection works by checking whether the
+# preset's regex matches anything inside a candidate directory.
+
+import re as _re
+
+# Subfolder names commonly used by VCF for each component. The detector
+# checks both these conventional names and falls back to recursive scan.
+COMPONENT_HINTS = {
+    "sddc_manager":  ["sddc-manager-backup", "sddc-manager"],
+    "nsx":           ["cluster-node-backups", "nsx", "nsx-t"],
+    "nsx_inventory": ["inventory-summary"],
+    "vcenter":       ["vCenter", "vcenter", "vc"],
+    "vcf9_fleet":    ["fleet", "fleet-backups"],
+}
+
+
+def _scan_for_preset(path: Path, preset_key: str, max_depth: int = 4) -> bool:
+    """Return True if at least one item under `path` matches `preset_key`."""
+    from vcf_backup_retention import PRESETS  # type: ignore
+    preset = PRESETS.get(preset_key)
+    if preset is None:
+        return False
+    try:
+        regex = _re.compile(preset["pattern"])
+    except _re.error:
+        return False
+    want_file = (preset["type"] == "file")
+
+    # BFS up to max_depth levels (avoid pathologically deep scans)
+    stack = [(path, 0)]
+    while stack:
+        current, depth = stack.pop()
+        try:
+            for item in current.iterdir():
+                try:
+                    if regex.match(item.name):
+                        if want_file and item.is_file():
+                            return True
+                        if (not want_file) and item.is_dir():
+                            return True
+                    if item.is_dir() and depth < max_depth:
+                        stack.append((item, depth + 1))
+                except (OSError, PermissionError):
+                    continue
+        except (OSError, PermissionError, NotADirectoryError):
+            continue
+    return False
+
+
+def _resolve_component_path(instance_dir: Path, preset_key: str) -> Path:
+    """Pick the most likely path within an instance for a given component.
+
+    First check conventional subfolder names; if a hint matches, return it.
+    Otherwise return the instance_dir itself (the script searches recursively
+    so it'll still find the items)."""
+    hints = COMPONENT_HINTS.get(preset_key, [])
+    for h in hints:
+        candidate = instance_dir / h
+        if candidate.is_dir():
+            return candidate
+    return instance_dir
+
+
+def _detect_instances(top: Path):
+    """List subdirectories of `top` that look like backup instances.
+
+    Returns a list of Path objects. Instances are immediate subdirs that
+    are not hidden and contain at least one matching component.
+    """
+    detected, _skipped = _detect_instances_with_skipped(top)
+    return detected
+
+
+def _detect_instances_with_skipped(top: Path):
+    """Like _detect_instances but also returns the list of subdirs that
+    were checked but had no recognised content. Useful for letting users
+    know about empty/newly-set-up directories.
+
+    Returns (detected, skipped) where each is a list of Path objects.
+    """
+    if not top.exists() or not top.is_dir():
+        return [], []
+    detected = []
+    skipped = []
+    try:
+        for entry in sorted(top.iterdir()):
+            if not entry.is_dir() or entry.name.startswith("."):
+                continue
+            # Quick check: does ANY preset find anything here?
+            found = False
+            for preset_key in COMPONENT_HINTS.keys():
+                if _scan_for_preset(entry, preset_key, max_depth=4):
+                    detected.append(entry)
+                    found = True
+                    break
+            if not found:
+                skipped.append(entry)
+    except (OSError, PermissionError):
+        pass
+    return detected, skipped
+
+
+def _detect_components(instance_dir: Path):
+    """Return list of (preset_key, resolved_path) tuples for components
+    found inside an instance directory."""
+    found = []
+    for preset_key in ["sddc_manager", "nsx", "nsx_inventory", "vcenter", "vcf9_fleet"]:
+        path = _resolve_component_path(instance_dir, preset_key)
+        if _scan_for_preset(path, preset_key, max_depth=4):
+            found.append((preset_key, path))
+    return found
+
+
+def _guess_vcf_version(component_keys) -> str:
+    """Return 'vcf52' or 'vcf9' based on detected components."""
+    if "vcf9_fleet" in component_keys:
+        return "vcf9"
+    return "vcf52"
 
 
 # ---------------------------------------------------------------------------
@@ -481,21 +609,31 @@ class Wizard:
             "TIP: Where a default value is offered, it is pre-filled at the\n"
             "     cursor. Press Enter to accept, or use Backspace / typing\n"
             "     to edit it.\n"
+            "\n"
+            "TIP: You can manage multiple VCF instances in one config. The\n"
+            "     wizard will let you add instances one after another, or\n"
+            "     load an existing config and append to it later.\n"
         ))
 
         mode = prompt_choice(
             "Choose a setup mode:",
             [
-                "Simple   - guided setup using built-in VCF presets (recommended)",
-                "Advanced - full control: custom targets, regex patterns, overrides",
+                "Simple    - guided setup using built-in VCF presets (recommended)",
+                "Advanced  - full control: custom targets, regex patterns, overrides",
+                "Autodetect VCF 5.2.x - point at a top folder, wizard finds instances",
+                "Autodetect VCF 9.x   - point at a top folder, wizard finds instances",
             ],
             default_idx=1,
         )
 
         if mode == 1:
             self.run_simple()
-        else:
+        elif mode == 2:
             self.run_advanced()
+        elif mode == 3:
+            self.run_autodetect(vcf_hint="vcf52")
+        else:
+            self.run_autodetect(vcf_hint="vcf9")
 
         self.preview_and_save()
 
@@ -504,22 +642,62 @@ class Wizard:
     def run_simple(self):
         section("Simple setup")
 
-        # Which VCF version - explicit choice, no default. If the user has
-        # both versions, they can run the wizard twice (once per version).
-        vcf_choice = prompt_choice(
-            "Which VCF version do you back up?",
-            ["VCF 5.2.x only", "VCF 9.x only"],
-        )
-        do_v5 = (vcf_choice == 1)
-        do_v9 = (vcf_choice == 2)
+        # Optionally start from an existing config (so users can append more
+        # instances to a config they built earlier).
+        self._maybe_load_existing_config()
 
-        # Base path
-        base_root = prompt_text(
-            "Where on this server do backups land? (base path)",
-            default=default_backup_root(),
-        )
+        # If we just loaded an existing config, log already exists; otherwise
+        # ask now so it's set before any targets are added.
+        if not self.config["log"]:
+            self._ask_log_settings_simple()
 
-        # Log
+        # Loop: one instance at a time. Each instance is one VCF deployment
+        # with its own SFTP root (e.g. /home/backup/b-vcf, /home/backup/c-vcf).
+        instance_idx = 0
+        while True:
+            instance_idx += 1
+            existing = len(self.config["backup_targets"])
+            if existing > 0 and instance_idx == 1:
+                print(c_hint(
+                    f"Loaded existing config has {existing} target(s). "
+                    f"You can now add more instances to it.\n"
+                ))
+
+            section(f"Instance #{instance_idx}")
+
+            # VCF version for this instance
+            vcf_choice = prompt_choice(
+                "Which VCF version is this instance?",
+                ["VCF 5.2.x", "VCF 9.x"],
+            )
+            vcf_key = "vcf52" if vcf_choice == 1 else "vcf9"
+
+            # Instance label - used as a prefix in target names so the user
+            # can tell instances apart later in logs.
+            instance_label = prompt_text(
+                "Instance label (used as prefix in target names, e.g. 'b-vcf', 'prod', 'site-a')",
+            )
+
+            # Backup root for this instance
+            base_root = prompt_text(
+                "SFTP root path for this instance",
+                default=f"/home/backup/{instance_label}",
+            )
+
+            # Components for this instance
+            print()
+            print(c_hint(f"Now selecting components for instance '{instance_label}'..."))
+            self._add_components_simple(vcf_key, base_root, instance_label)
+
+            # Add another instance?
+            print()
+            if not prompt_yes_no(
+                f"Add another VCF instance to this config?",
+                default=False,
+            ):
+                break
+
+    def _ask_log_settings_simple(self):
         section("Logging")
         log_file = prompt_text(
             "Log file path",
@@ -532,21 +710,214 @@ class Wizard:
             "backup_count": 5,
         }
 
-        # Components per VCF
-        if do_v5:
-            section("VCF 5.2.x components")
-            self._add_components_simple("vcf52", base_root)
+    # --- autodetect mode ----------------------------------------------------
 
-        if do_v9:
-            section("VCF 9.x components")
-            self._add_components_simple("vcf9", base_root)
+    def run_autodetect(self, vcf_hint: str):
+        """Walk a top-level folder, detect instances + components, and let
+        the user accept or skip each one. `vcf_hint` is 'vcf52' or 'vcf9' -
+        used when component-based detection is ambiguous."""
+        section(f"Autodetect ({'VCF 5.2.x' if vcf_hint == 'vcf52' else 'VCF 9.x'})")
 
-    def _add_components_simple(self, vcf_key: str, base_root: str):
+        # Optionally start from existing config
+        self._maybe_load_existing_config()
+
+        if not self.config["log"]:
+            self._ask_log_settings_simple()
+
+        top = prompt_text(
+            "Top-level folder to scan for instances",
+            default="/home/backup",
+        )
+        top_path = Path(top)
+        if not top_path.exists() or not top_path.is_dir():
+            print(c_error(f"  '{top}' does not exist or is not a directory."))
+            return
+
+        # Build a set of (path, preset) tuples that are ALREADY in the config
+        # so we can skip them in autodetect rather than duplicating.
+        existing = {
+            (str(Path(t["path"]).resolve()), t.get("preset"))
+            for t in self.config["backup_targets"]
+            if t.get("preset")
+        }
+
+        print()
+        print(c_hint(f"Scanning {top_path} ..."))
+        instances, empty_subdirs = _detect_instances_with_skipped(top_path)
+
+        # Report empty / non-VCF subdirs - useful info for the user
+        if empty_subdirs:
+            print(c_warn(f"  Skipped {len(empty_subdirs)} subdir(s) with no recognised backups:"))
+            for sd in empty_subdirs:
+                print(f"    - {sd.name}  {c_hint('(empty or no recognised content - maybe newly set up?)')}")
+            print()
+
+        if not instances:
+            print(c_error("  No VCF backup instances found in this folder."))
+            print(c_hint("  Tip: an instance is a subdirectory that contains at least one"))
+            print(c_hint("       recognised VCF backup (SDDC Manager .tar.gz, NSX backup-*UTC,"))
+            print(c_hint("       vCenter sn_*/M_*, etc)."))
+            return
+
+        # Show summary first
+        print(c_success(f"  Found {len(instances)} candidate instance(s):"))
+        plan = []  # list of dicts: {instance_dir, label, vcf_key, components, new_components}
+        for inst in instances:
+            comps = _detect_components(inst)
+            if not comps:
+                continue
+            comp_keys = [k for k, _ in comps]
+            detected_version = _guess_vcf_version(comp_keys)
+
+            # Filter out components that are already in the existing config
+            new_comps = [
+                (k, p) for k, p in comps
+                if (str(p.resolve()), k) not in existing
+            ]
+            already_in_config = len(comps) - len(new_comps)
+
+            plan.append({
+                "instance_dir":   inst,
+                "label":          inst.name,
+                "vcf_key":        detected_version,
+                "components":     new_comps,
+                "all_components": comps,  # for display only
+                "already_count":  already_in_config,
+            })
+            v_label = "VCF 9.x" if detected_version == "vcf9" else "VCF 5.2.x"
+            comp_summary = ", ".join(k for k, _ in comps)
+            already_note = c_hint(f"  [{already_in_config} already in config]") if already_in_config > 0 else ""
+            print(f"    {c_value(inst.name):40s}  {c_hint(v_label)}  ({comp_summary}){already_note}")
+
+        if not plan:
+            print(c_error("  None of the detected instances had recognisable components."))
+            return
+
+        # Anything new to add?
+        total_new = sum(len(e["components"]) for e in plan)
+        if total_new == 0:
+            print()
+            print(c_success(
+                "  All detected components are already in the loaded config - nothing to add."
+            ))
+            return
+
+        print()
+        print(c_hint(
+            "For each instance below, the wizard will show what it found and\n"
+            "ask you to confirm. Press Enter to accept all defaults, or 'n'\n"
+            "to skip an instance / component. Components already in the loaded\n"
+            "config are skipped automatically."
+        ))
+
+        # Per-instance confirmation
+        for entry in plan:
+            if not entry["components"]:
+                # All components for this instance were already in the config
+                continue
+            self._autodetect_confirm_instance(entry, vcf_hint)
+
+    def _autodetect_confirm_instance(self, entry: dict, vcf_hint: str):
+        inst = entry["instance_dir"]
+        detected_version = entry["vcf_key"]
+        components = entry["components"]
+
+        section(f"Instance: {entry['label']}")
+
+        # If detection differs from the user's hint, warn but trust detection
+        if detected_version != vcf_hint:
+            actual = "VCF 9.x" if detected_version == "vcf9" else "VCF 5.2.x"
+            hint_label = "VCF 9.x" if vcf_hint == "vcf9" else "VCF 5.2.x"
+            print(c_warn(
+                f"  Note: detected components suggest {actual}, "
+                f"but you chose autodetect mode for {hint_label}."
+            ))
+
+        # Confirm we want this instance at all
+        if not prompt_yes_no(f"Include instance '{entry['label']}' in config?", default=True):
+            print(c_hint(f"  Skipping {entry['label']}."))
+            return
+
+        # Confirm/edit instance label (used as prefix in target names)
+        instance_label = prompt_text("Instance label (prefix in target names)", default=entry["label"])
+
+        # Per-component confirmation
+        version_label = "VCF 9.x" if detected_version == "vcf9" else "VCF 5.2.x"
+        for preset_key, detected_path in components:
+            display_name = next(
+                (n for k, n in COMPONENTS[detected_version] if k == preset_key),
+                preset_key,
+            )
+
+            print()
+            print(f"  Component: {c_value(display_name)}")
+            print(f"  {c_hint('Detected at:')} {c_value(str(detected_path))}")
+
+            if not prompt_yes_no(f"  Include this component?", default=True):
+                continue
+
+            path = prompt_text(f"  Path", default=str(detected_path))
+            defaults = DEFAULT_RETENTION[preset_key]
+            keep_days = prompt_int(
+                f"  Keep backups for how many days?",
+                default=defaults["keep_days"], min_val=1,
+            )
+            keep_min = prompt_int(
+                f"  Always keep at least how many newest backups?",
+                default=defaults["keep_minimum"], min_val=1,
+            )
+
+            target = {
+                "name":    f"[{instance_label}] {version_label} - {display_name}",
+                "enabled": True,
+                "path":    path,
+                "preset":  preset_key,
+                "retention": {
+                    "keep_days":    keep_days,
+                    "keep_minimum": keep_min,
+                },
+            }
+            self.config["backup_targets"].append(target)
+            print(c_success(f"    + Added '{target['name']}'"))
+
+    def _maybe_load_existing_config(self):
+        """Optionally load an existing config to append to."""
+        if not prompt_yes_no(
+            "Start from an existing config (to add more instances to it)?",
+            default=False,
+        ):
+            return
+
+        existing_path = prompt_text(
+            "Path to existing config",
+            default=self.output_path,
+        )
+        try:
+            with open(existing_path, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if "backup_targets" not in loaded:
+                print(c_error("File does not look like a valid retention config (no 'backup_targets')."))
+                return
+            self.config = {
+                "log": loaded.get("log", {}),
+                "backup_targets": loaded.get("backup_targets", []),
+            }
+            self.output_path = existing_path  # save back to same file by default
+            print(c_success(
+                f"Loaded {len(self.config['backup_targets'])} existing target(s) from {existing_path}"
+            ))
+        except FileNotFoundError:
+            print(c_warn(f"File not found - starting fresh."))
+        except json.JSONDecodeError as e:
+            print(c_error(f"Invalid JSON in {existing_path}: {e}. Starting fresh."))
+
+    def _add_components_simple(self, vcf_key: str, base_root: str, instance_label: str = ""):
+        version_label = "VCF 5.2.x" if vcf_key == "vcf52" else "VCF 9.x"
         for preset_name, label in COMPONENTS[vcf_key]:
             if not prompt_yes_no(f"Manage {label}?", default=True):
                 continue
             sub = DEFAULT_SUBPATH[preset_name]
-            default_path = f"{base_root.rstrip('/')}/{vcf_key}/{sub}"
+            default_path = f"{base_root.rstrip('/')}/{sub}"
             path = prompt_text(f"  Backup path for {label}", default=default_path)
             warn_if_path_missing(path)
 
@@ -560,8 +931,14 @@ class Wizard:
                 default=defaults["keep_minimum"], min_val=1,
             )
 
+            # Compose name with optional instance label prefix
+            if instance_label:
+                target_name = f"[{instance_label}] {version_label} - {label}"
+            else:
+                target_name = f"{version_label} - {label}"
+
             target = {
-                "name":    f"{'VCF 5.2.x' if vcf_key == 'vcf52' else 'VCF 9.x'} - {label}",
+                "name":    target_name,
                 "enabled": True,
                 "path":    path,
                 "preset":  preset_name,
@@ -579,25 +956,37 @@ class Wizard:
     def run_advanced(self):
         section("Advanced setup")
 
-        # Logging
-        section("Logging")
-        log_file = prompt_text(
-            "Log file path",
-            default=default_log_path(),
-        )
-        log_level = prompt_choice(
-            "Log level:",
-            ["DEBUG", "INFO", "WARNING", "ERROR"],
-            default_idx=2,
-        )
-        log_size = prompt_int("Max log file size in MB before rotation", default=10, min_val=1)
-        log_count = prompt_int("How many rotated log files to keep", default=5, min_val=1)
-        self.config["log"] = {
-            "file":         log_file,
-            "level":        ["DEBUG", "INFO", "WARNING", "ERROR"][log_level - 1],
-            "max_size_mb":  log_size,
-            "backup_count": log_count,
-        }
+        # Optionally start from an existing config (so users can append more
+        # targets to a config they built earlier).
+        self._maybe_load_existing_config()
+
+        # Logging - only ask if not loaded from existing config
+        if not self.config["log"]:
+            section("Logging")
+            log_file = prompt_text(
+                "Log file path",
+                default=default_log_path(),
+            )
+            log_level = prompt_choice(
+                "Log level:",
+                ["DEBUG", "INFO", "WARNING", "ERROR"],
+                default_idx=2,
+            )
+            log_size = prompt_int("Max log file size in MB before rotation", default=10, min_val=1)
+            log_count = prompt_int("How many rotated log files to keep", default=5, min_val=1)
+            self.config["log"] = {
+                "file":         log_file,
+                "level":        ["DEBUG", "INFO", "WARNING", "ERROR"][log_level - 1],
+                "max_size_mb":  log_size,
+                "backup_count": log_count,
+            }
+        else:
+            existing = len(self.config["backup_targets"])
+            if existing > 0:
+                print(c_hint(
+                    f"Loaded existing config has {existing} target(s). "
+                    f"Add more below.\n"
+                ))
 
         # Targets
         while True:
@@ -624,11 +1013,12 @@ class Wizard:
 
     def _add_preset_target_advanced(self):
         # Pick preset
-        preset_keys = ["sddc_manager", "nsx", "vcenter", "vcf9_fleet", "generic_timestamp_dir"]
+        preset_keys = ["sddc_manager", "nsx", "nsx_inventory", "vcenter", "vcf9_fleet", "generic_timestamp_dir"]
         preset_labels = [
-            "sddc_manager           - SDDC Manager .tar.gz files (VCF 5.x and 9.x)",
-            "nsx                    - NSX/NSX-T timestamped folders (VCF 5.x and 9.x)",
-            "vcenter                - vCenter VAMI sn_... folders (VCF 5.x and 9.x)",
+            "sddc_manager           - SDDC Manager .tar.gz + .sha256 files (VCF 5.x and 9.x)",
+            "nsx                    - NSX/NSX-T backup-*UTC folders (VCF 5.x and 9.x)",
+            "nsx_inventory          - NSX inventory-*UTC.json files (VCF 5.x and 9.x)",
+            "vcenter                - vCenter VAMI M_..._<date>-<time>_/ folders",
             "vcf9_fleet             - VCF 9 Fleet Manager / Identity Broker / Automation",
             "generic_timestamp_dir  - any directory whose name is a timestamp",
         ]
