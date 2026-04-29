@@ -330,6 +330,15 @@ def _guess_vcf_version(component_keys) -> str:
 # without external dependencies via termios on Linux/macOS and msvcrt on
 # Windows. Falls back to a [bracket] prompt when stdin/stdout aren't a TTY.
 
+# Characters that count as word separators for Ctrl-W / Ctrl-Left / Ctrl-Right.
+# Includes path separators so word-jump works naturally inside file paths.
+_WORD_SEPARATORS = set(" \t/\\:.")
+
+
+def _is_word_sep(c: str) -> bool:
+    return c in _WORD_SEPARATORS
+
+
 def _editable_input(prompt_str: str, default: str) -> str:
     """Show `prompt_str + default` with cursor at the end of `default`;
     let user edit and press Enter; return the final string.
@@ -365,42 +374,95 @@ def _editable_input(prompt_str: str, default: str) -> str:
 
 
 def _editable_input_unix(prompt_str: str, default: str) -> str:
-    """Linux/macOS implementation of editable input using termios."""
+    """Linux/macOS implementation of editable input using termios.
+
+    Full line editor: cursor can move freely within the line and
+    insert/delete at any position. Supports the standard readline-style
+    keybindings (Home/End/arrows, Ctrl-A/E/U/K/W, Delete, etc).
+    """
     import termios
 
-    sys.stdout.write(f"{prompt_str}: {default}")
-    sys.stdout.flush()
-
+    # Pre-fill the line. We track the buffer + cursor position separately.
     buf = list(default)
+    cursor = len(buf)  # cursor sits AFTER the last char by default
+
+    # Render the initial prompt + content. The cursor will end up at the
+    # very end after writing, which matches `cursor = len(buf)`.
+    sys.stdout.write(f"{prompt_str}: ")
+    sys.stdout.write("".join(buf))
+    sys.stdout.flush()
 
     fd = sys.stdin.fileno()
     old_attrs = termios.tcgetattr(fd)
     new_attrs = list(old_attrs)
-    # Turn off canonical mode (line buffering) and echo. Keep ISIG so Ctrl-C
-    # still works if needed; we also handle \x03 manually below for clarity.
+    # Turn off canonical mode + echo. We render everything ourselves.
     new_attrs[3] = new_attrs[3] & ~(termios.ICANON | termios.ECHO)
+
+    def redraw_from(pos: int):
+        """Redraw buffer starting at index `pos`, then position cursor at
+        the saved `cursor` index. Uses ANSI 'erase to end of line' to
+        clear stale characters when the buffer shrinks."""
+        # Move cursor backwards to position `pos`
+        # We don't know where the terminal cursor is - simplest approach:
+        # move cursor left by a lot, then right to where we want.
+        # In practice we always know our previous cursor position so we
+        # just move from there.
+        pass  # implemented inline below for clarity
+
+    def render_full():
+        """Erase the current line content and redraw everything from
+        the start of the buffer. Called after non-trivial edits."""
+        # Move cursor to start of buffer (cursor was at position `cursor`)
+        # Then erase to end of line and rewrite.
+        if cursor > 0:
+            sys.stdout.write(f"\x1b[{cursor}D")  # cursor left N times
+        sys.stdout.write("\x1b[K")  # erase to end of line
+        sys.stdout.write("".join(buf))
+        # Now cursor is at end of buffer; move it to desired position
+        tail = len(buf) - cursor_target[0]
+        if tail > 0:
+            sys.stdout.write(f"\x1b[{tail}D")
+        sys.stdout.flush()
+
+    # Use a 1-element list so the inner functions can mutate it (closure
+    # over the int wouldn't work cleanly).
+    cursor_target = [cursor]
+
+    def repaint():
+        """Erase from cursor-pos back to buffer start, redraw whole buffer,
+        then place cursor at cursor_target[0]."""
+        # Move to start of buffer
+        if cursor_target_prev[0] > 0:
+            sys.stdout.write(f"\x1b[{cursor_target_prev[0]}D")
+        # Erase to end of line and rewrite
+        sys.stdout.write("\x1b[K")
+        sys.stdout.write("".join(buf))
+        # Position cursor
+        tail = len(buf) - cursor_target[0]
+        if tail > 0:
+            sys.stdout.write(f"\x1b[{tail}D")
+        sys.stdout.flush()
+        cursor_target_prev[0] = cursor_target[0]
+
+    cursor_target_prev = [cursor]  # where the terminal cursor currently is
 
     try:
         termios.tcsetattr(fd, termios.TCSANOW, new_attrs)
         while True:
             ch = sys.stdin.read(1)
             if not ch:
-                # EOF
                 raise EOFError
 
-            # --- Enter / Return ---
+            # --- Enter ---
             if ch in ("\n", "\r"):
+                # Move terminal cursor to end of line so the newline lands
+                # in the right place.
+                tail = len(buf) - cursor_target[0]
+                if tail > 0:
+                    sys.stdout.write(f"\x1b[{tail}C")
                 sys.stdout.write("\n")
                 sys.stdout.flush()
                 return "".join(buf)
-
-            # --- Backspace / DEL ---
-            if ch in ("\x7f", "\x08"):
-                if buf:
-                    buf.pop()
-                    sys.stdout.write("\b \b")
-                    sys.stdout.flush()
-                continue
 
             # --- Ctrl-C ---
             if ch == "\x03":
@@ -408,78 +470,216 @@ def _editable_input_unix(prompt_str: str, default: str) -> str:
                 sys.stdout.flush()
                 raise KeyboardInterrupt
 
-            # --- Ctrl-D (EOF if buffer empty) ---
+            # --- Ctrl-D: EOF if buffer empty, else delete-forward ---
             if ch == "\x04":
                 if not buf:
                     sys.stdout.write("\n")
                     sys.stdout.flush()
                     raise EOFError
+                if cursor_target[0] < len(buf):
+                    del buf[cursor_target[0]]
+                    repaint()
                 continue
 
-            # --- Ctrl-U: clear line ---
+            # --- Backspace / DEL (delete char left of cursor) ---
+            if ch in ("\x7f", "\x08"):
+                if cursor_target[0] > 0:
+                    del buf[cursor_target[0] - 1]
+                    cursor_target[0] -= 1
+                    repaint()
+                continue
+
+            # --- Ctrl-A: move to start ---
+            if ch == "\x01":
+                cursor_target[0] = 0
+                repaint()
+                continue
+
+            # --- Ctrl-E: move to end ---
+            if ch == "\x05":
+                cursor_target[0] = len(buf)
+                repaint()
+                continue
+
+            # --- Ctrl-B: move left (alt to left arrow) ---
+            if ch == "\x02":
+                if cursor_target[0] > 0:
+                    cursor_target[0] -= 1
+                    repaint()
+                continue
+
+            # --- Ctrl-F: move right (alt to right arrow) ---
+            if ch == "\x06":
+                if cursor_target[0] < len(buf):
+                    cursor_target[0] += 1
+                    repaint()
+                continue
+
+            # --- Ctrl-K: kill to end of line ---
+            if ch == "\x0b":
+                if cursor_target[0] < len(buf):
+                    del buf[cursor_target[0]:]
+                    repaint()
+                continue
+
+            # --- Ctrl-U: kill to start of line ---
             if ch == "\x15":
-                while buf:
-                    buf.pop()
-                    sys.stdout.write("\b \b")
-                sys.stdout.flush()
+                if cursor_target[0] > 0:
+                    del buf[:cursor_target[0]]
+                    cursor_target[0] = 0
+                    repaint()
                 continue
 
             # --- Ctrl-W: delete previous word ---
             if ch == "\x17":
-                while buf and buf[-1] == " ":
-                    buf.pop()
-                    sys.stdout.write("\b \b")
-                while buf and buf[-1] != " ":
-                    buf.pop()
-                    sys.stdout.write("\b \b")
-                sys.stdout.flush()
+                if cursor_target[0] > 0:
+                    end = cursor_target[0]
+                    start = end
+                    # skip trailing separators
+                    while start > 0 and _is_word_sep(buf[start - 1]):
+                        start -= 1
+                    # skip non-separators
+                    while start > 0 and not _is_word_sep(buf[start - 1]):
+                        start -= 1
+                    del buf[start:end]
+                    cursor_target[0] = start
+                    repaint()
                 continue
 
-            # --- Escape sequences (arrow keys etc): consume and ignore ---
+            # --- Escape sequence: arrows, Home/End, Delete, etc ---
             if ch == "\x1b":
-                # Common ANSI: ESC [ X (3 bytes total). Read up to 2 more.
+                seq = ""
+                # Read up to 5 more bytes (longest reasonable seq is ~6 bytes)
+                # Most are 2-3 bytes after ESC. Use a small loop with timeout
+                # via non-blocking-ish reads.
                 try:
                     nxt = sys.stdin.read(1)
-                    if nxt == "[":
-                        sys.stdin.read(1)
+                    if nxt != "[" and nxt != "O":
+                        # ESC alone (e.g. ESC followed by some other key) - ignore
+                        continue
+                    seq += nxt
+                    # Read until we get a final byte (uppercase letter or ~)
+                    while True:
+                        c = sys.stdin.read(1)
+                        seq += c
+                        if c.isalpha() or c == "~":
+                            break
+                        if len(seq) > 8:  # safety
+                            break
                 except Exception:
-                    pass
+                    continue
+
+                # Common sequences:
+                #   ESC [ A   = up arrow
+                #   ESC [ B   = down arrow
+                #   ESC [ C   = right arrow
+                #   ESC [ D   = left arrow
+                #   ESC [ H   = Home
+                #   ESC [ F   = End
+                #   ESC O H   = Home (alt)
+                #   ESC O F   = End (alt)
+                #   ESC [ 1 ~ = Home
+                #   ESC [ 4 ~ = End
+                #   ESC [ 3 ~ = Delete
+                #   ESC [ 1 ; 5 C = Ctrl-Right
+                #   ESC [ 1 ; 5 D = Ctrl-Left
+
+                if seq in ("[D", "OD"):  # Left
+                    if cursor_target[0] > 0:
+                        cursor_target[0] -= 1
+                        repaint()
+                elif seq in ("[C", "OC"):  # Right
+                    if cursor_target[0] < len(buf):
+                        cursor_target[0] += 1
+                        repaint()
+                elif seq in ("[H", "OH", "[1~", "[7~"):  # Home
+                    cursor_target[0] = 0
+                    repaint()
+                elif seq in ("[F", "OF", "[4~", "[8~"):  # End
+                    cursor_target[0] = len(buf)
+                    repaint()
+                elif seq == "[3~":  # Delete (forward)
+                    if cursor_target[0] < len(buf):
+                        del buf[cursor_target[0]]
+                        repaint()
+                elif seq == "[1;5D":  # Ctrl-Left: jump word left
+                    p = cursor_target[0]
+                    while p > 0 and _is_word_sep(buf[p - 1]):
+                        p -= 1
+                    while p > 0 and not _is_word_sep(buf[p - 1]):
+                        p -= 1
+                    cursor_target[0] = p
+                    repaint()
+                elif seq == "[1;5C":  # Ctrl-Right: jump word right
+                    p = cursor_target[0]
+                    while p < len(buf) and not _is_word_sep(buf[p]):
+                        p += 1
+                    while p < len(buf) and _is_word_sep(buf[p]):
+                        p += 1
+                    cursor_target[0] = p
+                    repaint()
+                # Up/Down arrows ignored (no history support)
                 continue
 
-            # --- Printable character ---
+            # --- Printable character: insert at cursor ---
             if ch.isprintable():
-                buf.append(ch)
-                sys.stdout.write(ch)
-                sys.stdout.flush()
+                buf.insert(cursor_target[0], ch)
+                cursor_target[0] += 1
+                repaint()
             # else: ignore other control chars
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old_attrs)
 
 
 def _editable_input_windows(prompt_str: str, default: str) -> str:
-    """Windows implementation of editable input using msvcrt."""
+    """Windows implementation of editable input using msvcrt.
+
+    Full line editor with cursor movement, same feature set as the
+    Unix version. Reads keys via msvcrt.getwch() and decodes the
+    Windows special-key prefix (\\xe0 / \\x00 followed by a code).
+    """
     import msvcrt
 
-    sys.stdout.write(f"{prompt_str}: {default}")
+    buf = list(default)
+    cursor = [len(buf)]
+    cursor_prev = [len(buf)]
+
+    sys.stdout.write(f"{prompt_str}: ")
+    sys.stdout.write("".join(buf))
     sys.stdout.flush()
 
-    buf = list(default)
+    def repaint():
+        # Move cursor back to start of buffer
+        if cursor_prev[0] > 0:
+            sys.stdout.write(f"\x1b[{cursor_prev[0]}D")
+        # Erase to end of line and rewrite
+        sys.stdout.write("\x1b[K")
+        sys.stdout.write("".join(buf))
+        # Move to desired position
+        tail = len(buf) - cursor[0]
+        if tail > 0:
+            sys.stdout.write(f"\x1b[{tail}D")
+        sys.stdout.flush()
+        cursor_prev[0] = cursor[0]
 
     while True:
         ch = msvcrt.getwch()
 
         # --- Enter ---
         if ch in ("\r", "\n"):
+            tail = len(buf) - cursor[0]
+            if tail > 0:
+                sys.stdout.write(f"\x1b[{tail}C")
             sys.stdout.write("\n")
             sys.stdout.flush()
             return "".join(buf)
 
         # --- Backspace ---
         if ch == "\b":
-            if buf:
-                buf.pop()
-                sys.stdout.write("\b \b")
-                sys.stdout.flush()
+            if cursor[0] > 0:
+                del buf[cursor[0] - 1]
+                cursor[0] -= 1
+                repaint()
             continue
 
         # --- Ctrl-C ---
@@ -488,7 +688,7 @@ def _editable_input_windows(prompt_str: str, default: str) -> str:
             sys.stdout.flush()
             raise KeyboardInterrupt
 
-        # --- Ctrl-D / Ctrl-Z (EOF) ---
+        # --- Ctrl-D / Ctrl-Z (EOF if buffer empty) ---
         if ch in ("\x04", "\x1a"):
             if not buf:
                 sys.stdout.write("\n")
@@ -496,16 +696,97 @@ def _editable_input_windows(prompt_str: str, default: str) -> str:
                 raise EOFError
             continue
 
-        # --- Special keys (arrows etc): prefix \xe0 or \x00 + 1 byte ---
-        if ch in ("\xe0", "\x00"):
-            msvcrt.getwch()  # consume and ignore the second byte
+        # --- Ctrl-A / E / B / F / K / U / W shortcuts ---
+        if ch == "\x01":  # Ctrl-A: home
+            cursor[0] = 0
+            repaint()
+            continue
+        if ch == "\x05":  # Ctrl-E: end
+            cursor[0] = len(buf)
+            repaint()
+            continue
+        if ch == "\x02":  # Ctrl-B: left
+            if cursor[0] > 0:
+                cursor[0] -= 1
+                repaint()
+            continue
+        if ch == "\x06":  # Ctrl-F: right
+            if cursor[0] < len(buf):
+                cursor[0] += 1
+                repaint()
+            continue
+        if ch == "\x0b":  # Ctrl-K: kill to end
+            if cursor[0] < len(buf):
+                del buf[cursor[0]:]
+                repaint()
+            continue
+        if ch == "\x15":  # Ctrl-U: kill to start
+            if cursor[0] > 0:
+                del buf[:cursor[0]]
+                cursor[0] = 0
+                repaint()
+            continue
+        if ch == "\x17":  # Ctrl-W: delete previous word
+            if cursor[0] > 0:
+                end = cursor[0]
+                start = end
+                while start > 0 and _is_word_sep(buf[start - 1]):
+                    start -= 1
+                while start > 0 and not _is_word_sep(buf[start - 1]):
+                    start -= 1
+                del buf[start:end]
+                cursor[0] = start
+                repaint()
             continue
 
-        # --- Printable ---
+        # --- Special keys (arrows, Home, End, Delete) ---
+        # On Windows these come as \xe0 or \x00 followed by a code byte.
+        if ch in ("\xe0", "\x00"):
+            code = msvcrt.getwch()
+            #  K = left,  M = right,  G = home,  O = end,  S = delete
+            #  s = ctrl-left,  t = ctrl-right
+            if code == "K":  # Left
+                if cursor[0] > 0:
+                    cursor[0] -= 1
+                    repaint()
+            elif code == "M":  # Right
+                if cursor[0] < len(buf):
+                    cursor[0] += 1
+                    repaint()
+            elif code == "G":  # Home
+                cursor[0] = 0
+                repaint()
+            elif code == "O":  # End
+                cursor[0] = len(buf)
+                repaint()
+            elif code == "S":  # Delete (forward)
+                if cursor[0] < len(buf):
+                    del buf[cursor[0]]
+                    repaint()
+            elif code == "s":  # Ctrl-Left: jump word left
+                p = cursor[0]
+                while p > 0 and _is_word_sep(buf[p - 1]):
+                    p -= 1
+                while p > 0 and not _is_word_sep(buf[p - 1]):
+                    p -= 1
+                cursor[0] = p
+                repaint()
+            elif code == "t":  # Ctrl-Right: jump word right
+                p = cursor[0]
+                while p < len(buf) and not _is_word_sep(buf[p]):
+                    p += 1
+                while p < len(buf) and _is_word_sep(buf[p]):
+                    p += 1
+                cursor[0] = p
+                repaint()
+            # other special keys ignored
+            continue
+
+        # --- Printable character: insert at cursor ---
         if ch.isprintable():
-            buf.append(ch)
-            sys.stdout.write(ch)
-            sys.stdout.flush()
+            buf.insert(cursor[0], ch)
+            cursor[0] += 1
+            repaint()
 
 
 # ---------------------------------------------------------------------------
@@ -607,8 +888,14 @@ class Wizard:
             "config file you can use with vcf_backup_retention.py.\n"
             "\n"
             "TIP: Where a default value is offered, it is pre-filled at the\n"
-            "     cursor. Press Enter to accept, or use Backspace / typing\n"
-            "     to edit it.\n"
+            "     cursor. You can edit it freely:\n"
+            "       - Arrow keys (Left/Right) move within the line\n"
+            "       - Home/End jump to start/end\n"
+            "       - Backspace / Delete remove a character\n"
+            "       - Ctrl-W deletes a word, Ctrl-U clears to the start,\n"
+            "         Ctrl-K clears to the end\n"
+            "       - Ctrl-Left/Right jump by word (path separators count)\n"
+            "       - Enter accepts the (possibly edited) value\n"
             "\n"
             "TIP: You can manage multiple VCF instances in one config. The\n"
             "     wizard will let you add instances one after another, or\n"

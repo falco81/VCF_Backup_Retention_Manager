@@ -103,24 +103,36 @@ If you are setting up before any backup arrives, use `1` (simple). Use `2`
 
 ### Editable defaults
 
-Where a default value is offered, it is **pre-filled at the cursor** so you
-can press Enter to accept, or use Backspace / typing to edit it directly.
+Where a default value is offered, it is **pre-filled at the cursor** and
+you can edit it freely - move the cursor anywhere within the line and
+insert/delete characters at any position. No need to retype the whole
+default just to change one part.
 
 ```
 Where on this server do backups land? (base path): /backup█
-                                                          ↑ cursor
+                                                          ↑ cursor (blinking)
 ```
 
 Keyboard shortcuts inside an editable prompt:
 
 | Key | Action |
 |---|---|
-| Enter | Accept the current value |
-| Backspace | Delete the previous character |
-| Ctrl-U | Clear the entire line |
+| ← / → | Move cursor one character left / right |
+| Home / Ctrl-A | Jump to start of line |
+| End / Ctrl-E | Jump to end of line |
+| Ctrl-← / Ctrl-→ | Jump one word left / right (path separators count) |
+| Backspace | Delete character to the left of the cursor |
+| Delete | Delete character to the right of the cursor |
 | Ctrl-W | Delete the previous word |
+| Ctrl-U | Delete from cursor to start of line |
+| Ctrl-K | Delete from cursor to end of line |
+| Enter | Accept the (possibly edited) value |
 | Ctrl-C | Cancel the wizard |
 | Ctrl-D | Cancel (when the line is empty) |
+
+Word boundaries include spaces, tabs, slashes, backslashes, colons, and
+dots - so `Ctrl-W` on `/var/log/vcf-backup-retention.log` deletes one path
+segment at a time, `Ctrl-←` jumps backward by segment, etc.
 
 When the wizard runs without a TTY (piped input for automation), it falls
 back to a `[default]: ` prompt where empty input means "accept default".
