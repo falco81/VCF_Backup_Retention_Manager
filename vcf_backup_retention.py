@@ -182,6 +182,18 @@ def _is_windows() -> bool:
     return os.name == "nt"
 
 
+def _fmt_size(num_bytes: int) -> str:
+    """Format a byte count as a human-readable string."""
+    n = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB", "TB", "PB"):
+        if abs(n) < 1024.0:
+            if unit == "B":
+                return f"{int(n)} {unit}"
+            return f"{n:.2f} {unit}"
+        n /= 1024.0
+    return f"{n:.2f} EB"
+
+
 def _forbidden_roots():
     return _WINDOWS_FORBIDDEN if _is_windows() else _LINUX_FORBIDDEN
 
@@ -210,7 +222,14 @@ class BackupRetentionManager:
             "kept": 0,
             "deleted": 0,
             "errors": 0,
-            "bytes_freed": 0,
+            "bytes_total": 0,    # total size of ALL discovered backups (before clean)
+            "bytes_freed": 0,    # size of deleted backups (or would-delete in dry-run)
+        }
+        # Per-target stats overwritten in process_target. Using a dummy
+        # initial value avoids AttributeErrors in edge cases.
+        self._current_target_stats = {
+            "scanned": 0, "kept": 0, "deleted": 0,
+            "bytes_total": 0, "bytes_freed": 0,
         }
 
     # --- bootstrap ----------------------------------------------------------
@@ -418,6 +437,16 @@ class BackupRetentionManager:
             self.stats["skipped"] += 1
             return
 
+        # Per-target counters (logged at end of this target's processing).
+        target_stats = {
+            "scanned":     0,
+            "kept":        0,
+            "deleted":     0,
+            "bytes_total": 0,   # all backups discovered in this target
+            "bytes_freed": 0,   # those that will be / were deleted
+        }
+        self._current_target_stats = target_stats
+
         path_str = target.get("path")
         if not path_str:
             self.logger.error(f"Target '{name}' has no 'path' set - skipping.")
@@ -501,6 +530,20 @@ class BackupRetentionManager:
                 min_age_minutes=min_age_minutes,
             )
 
+        # Per-target size summary (helpful when reading the log)
+        ts = target_stats
+        if ts["scanned"] > 0:
+            size_total = ts["bytes_total"]
+            size_freed = ts["bytes_freed"]
+            size_after = size_total - size_freed
+            freed_label = "to free" if self.dry_run else "freed"
+            self.logger.info(
+                f"  Target totals: {ts['scanned']} backup(s), "
+                f"size before: {_fmt_size(size_total)}, "
+                f"{freed_label}: {_fmt_size(size_freed)}, "
+                f"after clean: {_fmt_size(size_after)}"
+            )
+
     def _apply_retention(self, parent_dir, root, items, item_type, regex, formats,
                          keep_days, keep_count, keep_minimum, min_age_minutes):
         # Pair (item, age), newest first
@@ -515,6 +558,19 @@ class BackupRetentionManager:
 
         self.logger.info(f"  Group '{label}': {len(with_age)} backups")
         self.stats["scanned"] += len(with_age)
+        self._current_target_stats["scanned"] += len(with_age)
+
+        # Tally total size of all backups in this group (regardless of fate).
+        # _get_size is called once here per item so we can show a complete
+        # "before clean" total even when nothing gets deleted.
+        is_file = (item_type == "file")
+        for item, _age in with_age:
+            try:
+                sz = self._get_size(item, is_file=is_file)
+                self.stats["bytes_total"] += sz
+                self._current_target_stats["bytes_total"] += sz
+            except Exception:
+                pass
 
         now = datetime.now()
         min_age_threshold = now - timedelta(minutes=min_age_minutes)
@@ -525,7 +581,7 @@ class BackupRetentionManager:
             # 1) Always keep the newest 'keep_minimum'
             if idx < keep_minimum:
                 self.logger.debug(f"    KEEP [{idx + 1}]: {item.name}  (minimum)")
-                self.stats["kept"] += 1
+                self.stats["kept"] += 1; self._current_target_stats["kept"] += 1
                 continue
 
             # 2) Never touch backups newer than min_age_minutes
@@ -534,7 +590,7 @@ class BackupRetentionManager:
                     f"    KEEP [{idx + 1}]: {item.name}  "
                     f"(younger than {min_age_minutes} min)"
                 )
-                self.stats["kept"] += 1
+                self.stats["kept"] += 1; self._current_target_stats["kept"] += 1
                 continue
 
             # 3) Within keep_count
@@ -542,7 +598,7 @@ class BackupRetentionManager:
                 self.logger.debug(
                     f"    KEEP [{idx + 1}]: {item.name}  (within keep_count={keep_count})"
                 )
-                self.stats["kept"] += 1
+                self.stats["kept"] += 1; self._current_target_stats["kept"] += 1
                 continue
 
             # 4) Within keep_days
@@ -553,13 +609,13 @@ class BackupRetentionManager:
                         f"    KEEP [{idx + 1}]: {item.name}  "
                         f"(within keep_days={keep_days})"
                     )
-                    self.stats["kept"] += 1
+                    self.stats["kept"] += 1; self._current_target_stats["kept"] += 1
                     continue
                 reason = f"older than {keep_days} days (age: {age:%Y-%m-%d %H:%M})"
             elif keep_count is not None:
                 reason = f"beyond keep_count={keep_count}"
             else:
-                self.stats["kept"] += 1
+                self.stats["kept"] += 1; self._current_target_stats["kept"] += 1
                 continue
 
             to_delete.append((item, age, reason))
@@ -587,6 +643,8 @@ class BackupRetentionManager:
             )
             self.stats["deleted"] += 1
             self.stats["bytes_freed"] += size
+            self._current_target_stats["deleted"] += 1
+            self._current_target_stats["bytes_freed"] += size
             return
 
         try:
@@ -600,6 +658,8 @@ class BackupRetentionManager:
             )
             self.stats["deleted"] += 1
             self.stats["bytes_freed"] += size
+            self._current_target_stats["deleted"] += 1
+            self._current_target_stats["bytes_freed"] += size
         except Exception as e:
             self.logger.error(f"    Failed to delete {path}: {e}")
             self.stats["errors"] += 1
@@ -629,7 +689,11 @@ class BackupRetentionManager:
                 )
                 self.stats["errors"] += 1
 
-        gb_freed = self.stats["bytes_freed"] / (1024 ** 3)
+        bytes_total = self.stats["bytes_total"]
+        bytes_freed = self.stats["bytes_freed"]
+        bytes_after = bytes_total - bytes_freed
+        freed_label = "Space to free" if self.dry_run else "Space freed"
+
         self.logger.info("########## Run Summary ##########")
         self.logger.info(f"  Targets processed : {self.stats['targets']}")
         self.logger.info(f"  Targets skipped   : {self.stats['skipped']}")
@@ -637,7 +701,10 @@ class BackupRetentionManager:
         self.logger.info(f"  Kept              : {self.stats['kept']}")
         self.logger.info(f"  Deleted           : {self.stats['deleted']}")
         self.logger.info(f"  Errors            : {self.stats['errors']}")
-        self.logger.info(f"  Space freed       : {gb_freed:.2f} GB")
+        self.logger.info(f"  ----- Capacity -----")
+        self.logger.info(f"  Size before clean : {_fmt_size(bytes_total)}")
+        self.logger.info(f"  {freed_label:17s} : {_fmt_size(bytes_freed)}")
+        self.logger.info(f"  Size after clean  : {_fmt_size(bytes_after)}")
         self.logger.info("########## End of Run ##########")
 
         return 0 if self.stats["errors"] == 0 else 1

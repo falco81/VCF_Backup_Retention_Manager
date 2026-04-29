@@ -858,7 +858,18 @@ tail -f /var/log/vcf-backup-retention.log
 ls -l /var/log/vcf-backup-retention.log*
 ```
 
-Each run ends with a summary block:
+Each target's processing ends with a one-line size summary:
+
+```
+[INFO] === Processing target: [b-vcf] VCF 5.2.x - SDDC Manager ===
+[INFO]   Found 60 file(s) matching pattern
+[INFO]   Group '<root>': 60 backups
+[INFO]   Target totals: 60 backup(s), size before: 1.46 GB, freed: 800.02 MB, after clean: 700.01 MB
+```
+
+In dry-run mode the label is `to free` instead of `freed`.
+
+Each run finishes with an aggregated summary block:
 
 ```
 ########## Run Summary ##########
@@ -868,9 +879,15 @@ Each run ends with a summary block:
   Kept              : 128
   Deleted           : 107
   Errors            : 0
-  Space freed       : 12.34 GB
+  ----- Capacity -----
+  Size before clean : 142.30 GB
+  Space freed       : 18.42 GB
+  Size after clean  : 123.88 GB
 ########## End of Run ##########
 ```
+
+The capacity numbers cover all backups discovered by all targets in this
+run, regardless of `enabled` flag (disabled targets are not scanned).
 
 ---
 
