@@ -481,13 +481,23 @@ two stay in sync.
 - **Mode:** `directory`
 - **For:** vCenter Server file-based backups via VAMI (VCF 5.x and 9.x).
 
-VCF 5.2.x layout (two-level): `<root>/sn_<fqdn>/M_<version>_<YYYYMMDD>-<HHMMSS>_/`.
-The preset matches the inner timestamp folder. The legacy flat form
-(`sn_<ip>M_..._<date>_<time>_<hash>=`) is also accepted.
+VCF 5.2.x layout (two-level): `<root>/sn_<fqdn>/<prefix>_<version>_<YYYYMMDD>-<HHMMSS>_[<suffix>]/`.
+
+The first letter of the inner folder marks the trigger:
+
+- **`M_`** — manual backup (operator-triggered from VAMI or API)
+- **`S_`** — scheduled backup (VAMI schedule)
+
+The trailing suffix is sometimes empty (older releases), sometimes a
+base32-encoded blob ending with `=` padding
+(e.g. `KRCVGVBAIJQWG23VOA======`) on newer vCenter releases.
+
+The legacy flat form (`sn_<ip>M_..._<date>_<time>_<hash>=`) is also
+accepted.
 
 ```regex
 ^(?:
-   M_.+?_(\d{8})-(\d{6})_?
+   [MS]_.+?_(\d{8})-(\d{6})_[A-Za-z0-9=]*
  | sn_.+?_(\d{8})_(\d{6})_.+
 )$
 ```
@@ -495,14 +505,18 @@ The preset matches the inner timestamp folder. The legacy flat form
 ```
 /home/backup/b-vcf/vCenter/
 └── sn_b-w01-vc01.infra.pcr.cz/
-    ├── M_8.0.3.00800_20260427-104119_/
-    ├── M_8.0.3.00800_20260428-104119_/
-    └── M_8.0.3.00800_20260429-104119_/
+    ├── M_8.0.3.00800_20260427-104119_                          # manual, empty suffix
+    ├── M_8.0.3.00800_20260428-104119_KRCVGVBAIJQWG23VOA======  # manual, base32 suffix
+    └── S_8.0.3.00800_20260429-235909_                          # scheduled
 ```
 
-vCenter has its own retention setting in VAMI. This preset is mostly a
-safety net - keep `keep_minimum` at least as high as the VAMI setting
-so the two never disagree.
+Both `M_` and `S_` backups for the same host are grouped together
+(same `sn_<fqdn>` parent) so retention is calculated across all of
+them, ordered newest-first by their timestamp.
+
+vCenter has its own retention setting in VAMI for scheduled backups.
+This preset is mostly a safety net - keep `keep_minimum` at least as
+high as the VAMI setting so the two never disagree.
 
 ### Preset: `vcf9_fleet`
 

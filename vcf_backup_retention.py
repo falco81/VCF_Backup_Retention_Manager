@@ -94,17 +94,23 @@ PRESETS = {
 
     # vCenter Server file-based backup (VAMI). Layout observed on real VCF
     # 5.2.x systems is two levels:
-    #   <root>/sn_<fqdn>/M_<version>_<YYYYMMDD>-<HHMMSS>_/<files>
-    # The timestamp folder we manage is the inner 'M_..._..._' one. Older
-    # vCenter releases stored a flat folder name with everything baked in:
+    #   <root>/sn_<fqdn>/<prefix>_<version>_<YYYYMMDD>-<HHMMSS>_[<suffix>]/
+    #
+    # The first letter of the inner folder is:
+    #   M_ = manual backup (operator-triggered)
+    #   S_ = scheduled backup (VAMI schedule)
+    #
+    # The trailing suffix is sometimes empty, sometimes a base32-encoded
+    # blob ending with '=' padding (e.g. KRCVGVBAIJQWG23VOA======).
+    # Older vCenter releases used a flat layout:
     #   sn_<ip>M_<version>_<YYYYMMDD>_<HHMMSS>_<base64>=
-    # Both forms are matched. Outer alternation is non-capturing.
+    # Outer alternation is non-capturing.
     "vcenter": {
         "type": "directory",
         "pattern": (
             r"^(?:"
-            r"M_.+?_(\d{8})-(\d{6})_?"          # nested: M_8.0.3.00800_20260429-104119_
-            r"|sn_.+?_(\d{8})_(\d{6})_.+"       # legacy flat: sn_<ip>M_..._20250425_030015_<hash>=
+            r"[MS]_.+?_(\d{8})-(\d{6})_[A-Za-z0-9=]*"   # nested: M_/S_ ..._<date>-<time>_[suffix]
+            r"|sn_.+?_(\d{8})_(\d{6})_.+"               # legacy flat: sn_<ip>M_..._<date>_<time>_<hash>=
             r")$"
         ),
         "timestamp_formats": ["%Y%m%d%H%M%S"],
